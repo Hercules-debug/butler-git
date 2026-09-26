@@ -1,0 +1,9 @@
+# 插件的 peer deps 是**开发时**软链到 DSH 的,不进仓库
+# (正式安装时由 profile 提供 peer)
+plugin/node_modules/
+
+# 工具自己的状态目录 —— 每个项目一份,不该进仓库
+.bg/
+
+.DS_Store
+*.log
