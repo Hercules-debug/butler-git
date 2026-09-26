@@ -718,22 +718,81 @@ head("验收 16:changed(增量谓词) —— 「改动了」和「没改」要�
     bad(`没改却被算成改过: ${r.out.trim().slice(0, 140)}`);
   }
 
-  // 误用:changed 一个**新建**的文件 -> 要指出该用 fsExists
-  bg(d, ["declare", "--id", "m1", "--expect", "x", "--fs-changed", "B"]);
+  // 误用:changed 一个**在这个节点期间新建**的文件 -> 要指出该用 fsExists
+  //
+  // 注意必须"在这个节点期间"才触发 —— 节点基线是**声明时刻**,
+  // 声明之前就存在的文件对它来说不是"创建"。
+  write(d, "KEEP", "here\n");
+  sh("git add -A && git -c user.email=a@b -c user.name=a commit -q -m keep", d);
+  bg(d, ["declare", "--id", "m1", "--expect", "x", "--fs-changed", "NEWF"]);
+  write(d, "NEWF", "created during the node\n");
   const r1 = bg(d, ["assert", "m1"]);
   if (r1.code !== 0 && /创建/.test(r1.out) && /fsExists/.test(r1.out)) {
-    ok("对新建的文件用 changed -> 报「那是创建」并指向 fsExists(方向不能丢)");
+    ok("节点期间新建的文件用 changed -> 报「那是创建」并指向 fsExists(方向不能丢)");
   } else {
     bad(`创建/改 没分清: ${r1.out.trim().slice(0, 140)}`);
   }
 
-  // 误用:changed 一个**被删**的文件 -> 要指出该用 fsAbsent
-  bg(d, ["declare", "--id", "m2", "--expect", "x", "--fs-changed", "C"]);
+  // 误用:changed 一个**在这个节点期间被删**的文件 -> 要指出该用 fsAbsent
+  write(d, "GONE", "will be deleted\n");
+  sh("git add -A && git -c user.email=a@b -c user.name=a commit -q -m gone", d);
+  bg(d, ["declare", "--id", "m2", "--expect", "x", "--fs-changed", "GONE"]);
+  sh("rm GONE", d);
   const r2 = bg(d, ["assert", "m2"]);
   if (r2.code !== 0 && /删除/.test(r2.out) && /fsAbsent/.test(r2.out)) {
-    ok("对被删的文件用 changed -> 报「那是删除」并指向 fsAbsent");
+    ok("节点期间被删的文件用 changed -> 报「那是删除」并指向 fsAbsent");
   } else {
     bad(`删除/改 没分清: ${r2.out.trim().slice(0, 140)}`);
+  }
+
+  // --- changed 的两条边界,都是实测踩出来的 ---
+
+  // 边界 A:**节点基线**,不是项目基线。
+  // node1 改过 A 之后,node2 也声明 changed(A) 却什么都不做 —— 必须被抓住。
+  // (用 init 基线的话,node2 会白拿:"v1 != v2" 于是通过。)
+  const dA = newRepo();
+  write(dA, "A", "v1\n");
+  sh("git add -A && git -c user.email=a@b -c user.name=a commit -q -m base", dA);
+  bg(dA, ["init"]);
+  bg(dA, ["declare", "--id", "node1", "--expect", "A -> v2", "--allow", "A", "--fs-changed", "A"]);
+  write(dA, "A", "v2\n");
+  bg(dA, ["accept", "node1"]);
+  bg(dA, ["declare", "--id", "node2", "--expect", "A -> v3", "--allow", "A", "--fs-changed", "A"]);
+  // node2 什么都不做
+  const rA = bg(dA, ["assert", "node2"]);
+  if (rA.code !== 0 && /没有改动/.test(rA.out)) {
+    ok("前一个节点改过 A,后一个节点没动 -> 抓到(不拿项目基线白捡)");
+  } else {
+    bad(`后一个节点白拿了前一个的改动: ${rA.out.trim().slice(0, 140)}`);
+  }
+  write(dA, "A", "v3\n");
+  if (bg(dA, ["assert", "node2"]).code === 0) {
+    ok("后一个节点真改了 -> 过");
+  } else {
+    bad("真改了却没过");
+  }
+
+  // 边界 B:**被 .gitignore 的产物路径**。
+  // git 的工作区视图看不见它(ls-files/树/status 都是),但 **hash-object 算得出** ——
+  // 所以 changed 在 build/ 这类路径上也成立。这是"用 git 的对象模型统一"的意义。
+  const dB = newRepo();
+  write(dB, ".gitignore", "build/\n");
+  write(dB, "x.py", "v1\n");
+  sh("git add -A && git -c user.email=a@b -c user.name=a commit -q -m base", dB);
+  bg(dB, ["init"]);
+  write(dB, "build/out.js", "compiled-1\n");
+  bg(dB, ["declare", "--id", "art", "--expect", "重新编译", "--fs-changed", "build/out.js"]);
+  const rB1 = bg(dB, ["assert", "art"]);
+  if (rB1.code !== 0) {
+    ok("ignored 路径上 changed 算得出来(没改 -> 不过,而不是报『那是创建』)");
+  } else {
+    bad("ignored 路径上 changed 直接通过了(没改却说改过)");
+  }
+  write(dB, "build/out.js", "compiled-2\n");
+  if (bg(dB, ["assert", "art"]).code === 0) {
+    ok("ignored 路径改了 -> 过(git 的树看不见它,但 hash-object 看得见)");
+  } else {
+    bad(`ignored 路径改了却没过: ${bg(dB, ["assert", "art"]).out.trim().slice(0, 140)}`);
   }
 
   // **它的弱点,明写成验收**:changed 是相对判据,
