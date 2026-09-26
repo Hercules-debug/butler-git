@@ -678,6 +678,79 @@ head("验收 15:图是【每个项目一份】的 —— 指错目录不能安�
   }
 }
 
+// ================================================================ 验收 16
+head("验收 16:changed(增量谓词) —— 「改动了」和「没改」要分得开");
+
+// 缺这个谓词的时候,"改了 A" 只能用 `contains(A, 新内容)` 间接表达 ——
+// 而那证明的是"有这串字",不是"动过"。两种失败都实测过:
+//   改法不同 -> 误报失败;   内容被毁 -> 漏过。
+{
+  const d = newRepo();
+  write(d, "A", "old\nkeep1\nkeep2\n");
+  write(d, "C", "c-content\n");
+  sh("git add -A && git -c user.email=a@b -c user.name=a commit -q -m base", d);
+  bg(d, ["init"]);
+
+  // 「改了A / 生成了B / 删除了C」—— 三个谓词各管一件,每个都带方向
+  const dec = bg(d, ["declare", "--id", "n", "--expect", "改A 生成B 删C",
+    "--allow", "A", "--allow", "B", "--allow", "C",
+    "--fs-changed", "A", "--fs-exists", "B", "--fs-absent", "C"]);
+  if (dec.code === 0) ok("changed 进了契约(而且没被当成白给的门禁)");
+  else bad(`声明失败: ${dec.out.trim().slice(0, 120)}`);
+
+  // 做对:A 的内容改成**什么都行** —— changed 不要求内容
+  write(d, "A", "COMPLETELY-DIFFERENT\n");
+  write(d, "B", "b\n");
+  sh("rm C", d);
+  if (bg(d, ["assert", "n"]).code === 0) {
+    ok("三件都做了 -> 过(changed 不要求内容是什么)");
+  } else {
+    bad("做对了却没过");
+  }
+
+  // **没改** -> 必须抓住。这一条同时守着 fileAt 的 trim bug:
+  // 如果读基线内容时把结尾换行 trim 掉,"还原成基线"会被误判成"有变"。
+  write(d, "A", "old\nkeep1\nkeep2\n");
+  const r = bg(d, ["assert", "n"]);
+  if (r.code !== 0 && /一模一样/.test(r.out)) {
+    ok("A 还原成基线内容 -> 报「和基线一模一样」(没被 trim 掉结尾换行骗过)");
+  } else {
+    bad(`没改却被算成改过: ${r.out.trim().slice(0, 140)}`);
+  }
+
+  // 误用:changed 一个**新建**的文件 -> 要指出该用 fsExists
+  bg(d, ["declare", "--id", "m1", "--expect", "x", "--fs-changed", "B"]);
+  const r1 = bg(d, ["assert", "m1"]);
+  if (r1.code !== 0 && /创建/.test(r1.out) && /fsExists/.test(r1.out)) {
+    ok("对新建的文件用 changed -> 报「那是创建」并指向 fsExists(方向不能丢)");
+  } else {
+    bad(`创建/改 没分清: ${r1.out.trim().slice(0, 140)}`);
+  }
+
+  // 误用:changed 一个**被删**的文件 -> 要指出该用 fsAbsent
+  bg(d, ["declare", "--id", "m2", "--expect", "x", "--fs-changed", "C"]);
+  const r2 = bg(d, ["assert", "m2"]);
+  if (r2.code !== 0 && /删除/.test(r2.out) && /fsAbsent/.test(r2.out)) {
+    ok("对被删的文件用 changed -> 报「那是删除」并指向 fsAbsent");
+  } else {
+    bad(`删除/改 没分清: ${r2.out.trim().slice(0, 140)}`);
+  }
+
+  // **它的弱点,明写成验收**:changed 是相对判据,
+  // "把 A 清空"也算"改过" —— 所以它不能单独用。
+  const d2 = newRepo();
+  write(d2, "A", "important\nlots\nof\ncontent\n");
+  sh("git add -A && git -c user.email=a@b -c user.name=a commit -q -m base", d2);
+  bg(d2, ["init"]);
+  bg(d2, ["declare", "--id", "c", "--expect", "x", "--fs-changed", "A"]);
+  write(d2, "A", "");
+  if (bg(d2, ["assert", "c"]).code === 0) {
+    ok("(已知弱点)把文件清空也算「改过」—— 相对判据允许任何改变,不能单独用");
+  } else {
+    bad("清空竟然没过?那语义和文档不符");
+  }
+}
+
 // ================================================================ 收尾
 
 for (const d of tmpdirs) rmSync(d, { recursive: true, force: true });

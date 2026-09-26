@@ -26,7 +26,7 @@ import { evaluateGate } from "../lib/gate.mjs";
 import { render, renderDetail, healthLine } from "../lib/view.mjs";
 
 const REPEATABLE = new Set([
-  "allow", "fs-exists", "fs-absent", "fs-contains", "fs-not-contains",
+  "allow", "fs-exists", "fs-absent", "fs-contains", "fs-not-contains", "fs-changed",
   "proc-present", "proc-absent",
 ]);
 
@@ -95,7 +95,7 @@ function contractFrom({ flags }) {
       parent: flags.parent ?? null,
       owner: flags.owner ?? "model",
       allow: asList(flags.allow),
-      fs: { paths, tree: flags["fs-tree"] ?? null },
+      fs: { paths, changed: asList(flags["fs-changed"]), tree: flags["fs-tree"] ?? null },
       proc: {
         present: asList(flags["proc-present"]),
         absent: asList(flags["proc-absent"]),

@@ -121,6 +121,17 @@ const GATE_PARAMS = {
     items: { type: "string" },
     description: "【预期文件系统】'路径:字面串' —— 该文件必须**不含**这串字",
   },
+  fsChanged: {
+    type: "array",
+    items: { type: "string" },
+    description:
+      "【预期文件系统】这些路径的内容必须**和开工时不同**(增量谓词)。"
+      + "**不要求内容是什么** —— 它只回答'动过没有'。\n"
+      + "注意两点:(1) 它只认'改',不认'创建/删除' —— 那两种用 fsExists / fsAbsent,"
+      + "因为它们**带方向**,而 changed 会把方向和反方向说成同一件事;"
+      + "(2) 它是**相对判据**,允许任何改变,包括把文件清空 —— "
+      + "所以它不能单独用,内容对不对要靠 fsContains 或 fsTree。",
+  },
   fsTree: {
     type: "string",
     description:
@@ -184,7 +195,7 @@ function contractFromArgs(args) {
     parent: args.parent ?? null,
     owner: args.owner ?? "model",
     allow: args.allow ?? [],
-    fs: { paths, tree: args.fsTree ?? null },
+    fs: { paths, changed: args.fsChanged ?? [], tree: args.fsTree ?? null },
     proc: {
       present: args.procPresent ?? [],
       absent: args.procAbsent ?? [],
