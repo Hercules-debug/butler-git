@@ -65,7 +65,8 @@ if (!undeclared.length) {
 }
 
 const names = registered.map((t) => t.name).sort();
-const want = ["node_accept", "node_check", "node_declare", "node_health", "node_tree"];
+const want = ["node_accept", "node_check", "node_declare", "node_drop",
+  "node_health", "node_tree"];
 if (JSON.stringify(names) === JSON.stringify(want)) {
   ok(`注册了 ${names.length} 个工具: ${names.join(", ")}`);
 } else {
@@ -83,6 +84,28 @@ if (!("asUser" in declareTool.parameters.properties)) {
   ok("插件**不暴露** asUser —— 模型不能自己授权自己改人定的验收");
 } else {
   bad("插件把 asUser 暴露给模型了");
+}
+
+// BUG-4 回归守卫:每个工具都必须能**显式指定 project**。
+// 原来写死会话 cwd —— 于是"节点声明在 A 目录、会话在 B 目录"时,
+// 模型看不见自己刚声明的验收(实测过)。
+const noProject = registered
+  .filter((t) => !("project" in (t.parameters?.properties ?? {})))
+  .map((t) => t.name);
+if (!noProject.length) {
+  ok(`每个工具都能显式指定 project(${registered.length} 个全覆盖)`);
+} else {
+  bad(`这些工具没有 project 参数,只能看会话 cwd: ${noProject.join(", ")}`);
+}
+
+// BUG-5 回归守卫:patch 注释里的工具数必须和实现对得上。
+const patch = readFileSync(join(ROOT, "plugin", "cordis.patch.yml"), "utf8");
+const cn = { "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7 };
+const m = patch.match(/只注册\**([一二三四五六七])\**个/);
+if (m && cn[m[1]] === registered.length) {
+  ok(`cordis.patch.yml 的注释说「${m[1]}个」,和实现一致`);
+} else {
+  bad(`注释说的工具数和实现对不上: ${m ? cn[m[1]] : "(没写)"} vs ${registered.length}`);
 }
 
 // --- 2. 真的跑一遍 ---------------------------------------------------------

@@ -26,7 +26,7 @@
 import { defineTool } from "@deepseek-ai/dsh-tools";
 
 import { checkContract } from "../lib/contract.mjs";
-import { declare, accept, normalize } from "../lib/nodes.mjs";
+import { declare, accept, drop, normalize } from "../lib/nodes.mjs";
 import { render, renderDetail, healthLine } from "../lib/view.mjs";
 
 /** 插件的 Cordis 名称。 */
@@ -45,12 +45,32 @@ export const inject = ["tools"];
  *
  * 插件拿到的 ctx 没有 agent scope(所以是全局注册),
  * 但 execute 里能拿到 exec,那里有会话的 cwd。
+ *
+ * ## 为什么参数能覆盖它(BUG-4)
+ *
+ * 原来这里**写死**会话 cwd,而且工具的参数表里没有 `project`。
+ * 后果实测过:节点声明在 A 目录的 `.bg/`,而会话在 B 目录 ——
+ * 工具去找 B 的 `.bg/`,返回"(图是空的)"。
+ * **模型看不见自己刚声明的验收**,只能绕道 CLI。
+ *
+ * 所以每个工具都能显式给 `project`;不给才退回会话 cwd。
  */
-function projectOf(exec) {
-  return exec?.agent?.session?.header?.cwd ?? process.cwd();
+function projectOf(exec, args) {
+  return args?.project ?? exec?.agent?.session?.header?.cwd ?? process.cwd();
 }
 
 // ---------------------------------------------------------------- 参数表
+
+/** 每个工具都带的 `project`。见上面 `projectOf` 那段。 */
+const PROJECT_PARAM = {
+  project: {
+    type: "string",
+    description:
+      "工作目录(默认 = 会话 cwd)。图和账本都在它的 .bg/ 下。"
+      + "**当你要操作的项目不是你当前所在的目录时,必须显式给这个参数** —— "
+      + "否则工具会去找会话 cwd 的 .bg/,看不见你在别处声明的节点。",
+  },
+};
 
 /**
  * 门禁的紧凑参数。**file_contains 是两段,只切第一个冒号** ——
@@ -124,6 +144,9 @@ const GATE_PARAMS = {
       + "它验行为,前面那些只验痕迹。**它必须在基线时跑不过**,否则它等于没验",
   },
 };
+
+/** 门禁参数 + 每个工具都要的 project。 */
+const GATE_PARAMS_WITH_PROJECT = { ...GATE_PARAMS, ...PROJECT_PARAM };
 
 const OUTPUT = {
   type: "object",
@@ -199,10 +222,10 @@ export function apply(ctx) {
         + "  · 只有'不许留下什么'这类安全网,没有任何会失败的东西\n"
         + "\n"
         + "注意 check 只看门禁本身,**不看世界**。想知道某个节点现在过不过,用 node_accept。",
-      parameters: GATE_PARAMS,
+      parameters: GATE_PARAMS_WITH_PROJECT,
       output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
       async execute(args, exec) {
-        const dir = projectOf(exec);
+        const dir = projectOf(exec, args);
         const c = contractFromArgs(args);
         const r = checkContract(dir, c);
         return {
@@ -228,10 +251,10 @@ export function apply(ctx) {
         + "     回头改门禁 = 让当时的验收变成一句没法核对的话。\n"
         + "  2. **owner=user 且已经有一份门禁** -> 你改不动,要人授权。\n"
         + "     那是人和模型约定的验收,不是你自己拆的手段。",
-      parameters: GATE_PARAMS,
+      parameters: GATE_PARAMS_WITH_PROJECT,
       output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
       async execute(args, exec) {
-        const dir = projectOf(exec);
+        const dir = projectOf(exec, args);
         const c = contractFromArgs(args);
         // **绝不传 asUser。** 模型不能自己授权自己改人定的验收。
         const r = declare(dir, c, { asUser: false });
@@ -262,10 +285,11 @@ export function apply(ctx) {
       parameters: {
         stepId: { type: "string", required: true, description: "要验收的节点 id" },
         timeout: { type: "number", description: "验证程序的超时(毫秒),默认 120000" },
+        ...PROJECT_PARAM,
       },
       output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
       async execute(args, exec) {
-        const dir = projectOf(exec);
+        const dir = projectOf(exec, args);
         const r = accept(dir, args.stepId, { timeout: args.timeout ?? 120_000 });
         if (r.ok) {
           return {
@@ -305,10 +329,11 @@ export function apply(ctx) {
       parameters: {
         live: { type: "boolean", description: "连验证程序一起跑(贵,但完整)" },
         detail: { type: "string", description: "展开某个节点的细节(门禁逐条 + 证据锚)" },
+        ...PROJECT_PARAM,
       },
       output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
       async execute(args, exec) {
-        const dir = projectOf(exec);
+        const dir = projectOf(exec, args);
         const mode = args.live ? "full" : "cheap";
         if (args.detail) {
           return {
@@ -327,10 +352,40 @@ export function apply(ctx) {
     defineTool({
       name: "node_health",
       description: "心跳一行:有多少节点还没通过过。**只报第一盏灯**(便宜、永远算得起)。",
-      parameters: {},
+      parameters: { ...PROJECT_PARAM },
       output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
       async execute(_args, exec) {
-        return { ok: true, summary: healthLine(projectOf(exec)), lines: [] };
+        return { ok: true, summary: healthLine(projectOf(exec, _args)), lines: [] };
+      },
+    }),
+  );
+
+  // 放弃一个计划。
+  ctx.tools.register(
+    defineTool({
+      name: "node_drop",
+      description:
+        "**放弃一个从未通过过的计划**,把它从图里移出(账本里留着这条记录)。\n"
+        + "\n"
+        + "什么时候用:你为一个想法声明了节点,后来**决定不做了** ——\n"
+        + "期望本身不对、或者发现有现成实现、或者方向换了。\n"
+        + "\n"
+        + "**不要用改写来假装它还在**(那会让图看起来像「还在做这件事」)。\n"
+        + "也不必为了让它不红而硬凑一个通过 —— 那是自欺。\n"
+        + "\n"
+        + "通过过的节点不能直接 drop:先 retract 收回它(那条历史会留在账本里)。",
+      parameters: {
+        stepId: { type: "string", required: true, description: "要放弃的节点 id" },
+        reason: { type: "string", description: "为什么放弃 —— 写下来,它会进账本" },
+        ...PROJECT_PARAM,
+      },
+      output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
+      async execute(args, exec) {
+        const dir = projectOf(exec, args);
+        const r = drop(dir, args.stepId, args.reason ?? "");
+        return r.ok
+          ? { ok: true, summary: `[放弃 ${args.stepId}] 已从图里移出(账本里留着)`, lines: [] }
+          : { ok: false, summary: `[放弃 ${args.stepId}] 不行`, lines: r.problems.map((p) => `  ✗ ${p}`) };
       },
     }),
   );

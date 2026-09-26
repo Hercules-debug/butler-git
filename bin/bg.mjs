@@ -21,7 +21,7 @@ import { resolve } from "node:path";
 import { isRepo, head, treeOf, workingTreeHash } from "../lib/git.mjs";
 import * as store from "../lib/store.mjs";
 import { checkContract, checkVacuity } from "../lib/contract.mjs";
-import { declare, accept, retract, normalize } from "../lib/nodes.mjs";
+import { declare, accept, retract, drop, normalize } from "../lib/nodes.mjs";
 import { evaluateGate } from "../lib/gate.mjs";
 import { render, renderDetail, healthLine } from "../lib/view.mjs";
 
@@ -182,8 +182,23 @@ function cmdAssert(args, flags) {
     if (i.demand) console.log(`      -> 要求: ${i.demand}`);
   }
   if (r.empty) console.log("  (这个节点没有门禁)");
+  for (const n of r.notes ?? []) console.log(`  (说明) ${n}`);
   console.log(r.ok ? `[门禁 ${id}] 过` : `[门禁 ${id}] ${r.failed.length ? "不过" : "未复查"}`);
   return r.ok ? 0 : 1;
+}
+
+function cmdDrop(args, flags) {
+  const dir = projectDir(flags);
+  const id = args[0];
+  if (!id) { console.log("用法: bg drop <节点 id> [--reason ...]"); return 2; }
+  const r = drop(dir, id, flags.reason ?? "");
+  if (!r.ok) {
+    console.log(`[放弃 ${id}] 不行`);
+    for (const p of r.problems) console.log(`  ✗ ${p}`);
+    return 1;
+  }
+  console.log(`[放弃 ${id}] 已从图里移出(账本里留着这条记录)`);
+  return 0;
 }
 
 function cmdView(flags) {
@@ -219,6 +234,7 @@ const HELP = `bg —— git 原生的节点门禁
   accept  <id> [--timeout ms]       跑完整门禁;全过则点亮第一盏灯
   assert  <id> [--cheap]            门禁现在过不过(默认全跑)
   retract <id> [--reason ...]       作废(追加一条,不改写历史)
+  drop    <id> [--reason ...]       放弃一个**从未通过过**的计划(移出图,留账)
   view    [--live] [--detail <id>]  看树(两盏灯)
   health                            心跳一行
   treeinfo                          当前工作区树哈希 / 基线
@@ -238,6 +254,7 @@ function main() {
     case "accept": return cmdAccept(positional, flags);
     case "assert": return cmdAssert(positional, flags);
     case "retract": return cmdRetract(positional, flags);
+    case "drop": return cmdDrop(positional, flags);
     case "view": return cmdView(flags);
     case "health": return cmdHealth(flags);
     case "treeinfo": return cmdGateInfo(flags);

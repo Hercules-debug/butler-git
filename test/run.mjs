@@ -447,6 +447,186 @@ head("验收 10:作废是**追加**,不改写历史");
   }
 }
 
+// ================================================================ 验收 11
+head("验收 11:树哈希在【两种 .gitignore 写法】下都必须算得出来(BUG-1)");
+
+// 这一条是为一个真 bug 补的:
+//
+//   `workingTreeHash` 原来用 `git add -A -- . ':(exclude).bg'` 一步排除。
+//   `:(exclude)` 本身排得掉未跟踪目录,但 `git add` 会**先**拿 pathspec 匹配 `.bg`,
+//   撞上 `.gitignore` 就报错退出 —— 于是函数恒返回 null,
+//   证据锚永远是空的、任何 fsTree 门禁永远点不亮。
+//
+// **原来的测试全都漏了**,因为那些临时仓库都没有 `.gitignore`。
+// 所以这一条**两种写法都测**,少一种就会重新漏掉。
+for (const [label, ignored] of [["没有 .gitignore", false], ["有 .gitignore 且忽略 .bg/", true]]) {
+  const d = newRepo();
+  if (ignored) write(d, ".gitignore", "build/\n.bg/\n");
+  write(d, "x.py", "v1\n");
+  sh("git add -A && git -c user.email=a@b -c user.name=a commit -q -m base", d);
+  bg(d, ["init"]);
+
+  const t1 = JSON.parse(bg(d, ["treeinfo"]).out).workingTree;
+  if (!t1) {
+    bad(`[${label}] 树哈希是 null —— 证据锚会是空的,fsTree 门禁永远点不亮`);
+    continue;
+  }
+  ok(`[${label}] 树哈希算得出来(${t1.slice(0, 8)})`);
+
+  // 写一个节点 -> .bg/ 变了 -> 树哈希**不该**跟着漂
+  bg(d, ["declare", "--id", "n", "--expect", "x", "--fs-contains", "x.py:v2"]);
+  const t2 = JSON.parse(bg(d, ["treeinfo"]).out).workingTree;
+  if (t1 === t2) {
+    ok(`[${label}] .bg/ 的改动没有污染树哈希(被观测对象里不含观测者自己)`);
+  } else {
+    bad(`[${label}] 树哈希随 .bg/ 漂了 —— 门禁永远不可能通过`);
+  }
+
+  // 而且这个哈希必须真的**能当门禁用**:世界等于它 -> 过
+  write(d, "x.py", "v2\n");
+  const want = JSON.parse(bg(d, ["treeinfo"]).out).workingTree;
+  write(d, "x.py", "v1\n");
+  bg(d, ["declare", "--id", "t", "--expect", "世界等于预计", "--fs-tree", want]);
+  write(d, "x.py", "v2\n");
+  if (bg(d, ["assert", "t"]).code === 0) {
+    ok(`[${label}] fsTree 门禁能真的用(世界等于预计 -> 过)`);
+  } else {
+    bad(`[${label}] fsTree 门禁用不了`);
+  }
+}
+
+// ================================================================ 验收 12
+head("验收 12:渲染不能说假话 —— 「通过过」必须查第一盏灯(BUG-2)");
+
+{
+  const d = newRepo();
+  write(d, "x.py", "v1\n");
+  sh("git add -A && git -c user.email=a@b -c user.name=a commit -q -m base", d);
+  bg(d, ["init"]);
+  // 一个**从没验收过**、而且现在也不过 的节点
+  bg(d, ["declare", "--id", "n", "--expect", "x", "--fs-contains", "x.py:NEVER"]);
+  const v = bg(d, ["view"]);
+  const row = v.out.split("\n").find((l) => l.includes("n ")) ?? v.out.split("\n")[0];
+
+  if (!/通过过,但现在坏了/.test(v.out)) {
+    ok("从没通过过的节点**没有**被说成「通过过,但现在坏了」");
+  } else {
+    bad(`渲染在断言一个不成立的历史事实: ${row.trim()}`);
+  }
+  if (/没通过过,现在也不过/.test(v.out)) {
+    ok("说的是实话:「没通过过,现在也不过」");
+  } else {
+    bad(`措辞没对上实际状态: ${row.trim()}`);
+  }
+
+  // 反面:真的通过过、然后坏了 -> 那句话必须出现
+  const d2 = newRepo();
+  write(d2, "x.py", "v1\n");
+  sh("git add -A && git -c user.email=a@b -c user.name=a commit -q -m base", d2);
+  bg(d2, ["init"]);
+  bg(d2, ["declare", "--id", "n", "--expect", "x", "--fs-contains", "x.py:v2"]);
+  write(d2, "x.py", "v2\n");
+  bg(d2, ["accept", "n"]);
+  write(d2, "x.py", "v1\n");
+  if (/通过过,但现在坏了/.test(bg(d2, ["view"]).out)) {
+    ok("真的通过过又坏了 -> 仍然正确报出「通过过,但现在坏了」");
+  } else {
+    bad("真回归反而没报出来(修过头了)");
+  }
+}
+
+// ================================================================ 验收 13
+head("验收 13:可写边界真的执行(BUG-3)");
+
+{
+  const d = newRepo();
+  write(d, "src/a.py", "v1\n");
+  write(d, "x.py", "v1\n");
+  sh("git add -A && git -c user.email=a@b -c user.name=a commit -q -m base", d);
+  bg(d, ["init"]);
+  bg(d, ["declare", "--id", "n", "--expect", "只改 src", "--allow", "src/**",
+    "--fs-contains", "src/a.py:v2"]);
+
+  // 世界改对了 —— 但**同时**动了边界外的东西
+  write(d, "src/a.py", "v2\n");
+  write(d, "outside.txt", "tampered\n");
+  const r = bg(d, ["assert", "n"]);
+  if (r.code !== 0 && /越界/.test(r.out) && /outside\.txt/.test(r.out)) {
+    ok("边界外的改动被拦下(可写边界不再是描述)");
+    say(r.out.split("\n").find((l) => /越界/.test(l))?.trim() ?? "");
+  } else {
+    bad(`越界没被拦: ${r.out.trim().slice(0, 140)}`);
+  }
+
+  // 声明了边界的节点 -> 边界内改动应当过
+  const d2 = newRepo();
+  write(d2, "src/a.py", "v1\n");
+  sh("git add -A && git -c user.email=a@b -c user.name=a commit -q -m base", d2);
+  bg(d2, ["init"]);
+  bg(d2, ["declare", "--id", "n2", "--expect", "只改 src", "--allow", "src/**",
+    "--fs-contains", "src/a.py:v2"]);
+  write(d2, "src/a.py", "v2\n");
+  if (bg(d2, ["assert", "n2"]).code === 0) {
+    ok("边界内改动 -> 过(不误伤)");
+  } else {
+    bad("边界内改动被误判越界");
+  }
+}
+
+// ================================================================ 验收 14
+head("验收 14:放弃一个从未通过过的计划(BUG-7)");
+
+{
+  const d = newRepo();
+  write(d, "x.py", "v1\n");
+  sh("git add -A && git -c user.email=a@b -c user.name=a commit -q -m base", d);
+  bg(d, ["init"]);
+  // 「想做一个可视化」—— 后来决定不做了
+  bg(d, ["declare", "--id", "viz", "--expect", "做个可视化", "--fs-contains", "x.py:VIZ"]);
+
+  const before = bg(d, ["view"]);
+  if (/viz/.test(before.out)) ok("放弃前:节点在图里");
+  else bad("节点没进图");
+
+  const r = bg(d, ["drop", "viz", "--reason", "决定不做了,先做别的"]);
+  if (r.code === 0) ok("drop 成功(这是原来缺失的原语)");
+  else bad(`drop 失败: ${r.out.trim().slice(0, 120)}`);
+
+  const after = bg(d, ["view"]);
+  if (!/^ *viz/m.test(after.out)) {
+    ok("放弃后:节点从树里移出(图不再假装『还在做这件事』)");
+  } else {
+    bad(`放弃后节点还在树里: ${after.out.split("\n").find((l) => l.includes("viz"))}`);
+  }
+  if (/已放弃/.test(after.out)) {
+    ok("但它**没有凭空消失** —— 心跳里报出「已放弃」");
+  } else {
+    bad("放弃的节点凭空消失了(那也是一种『静默』)");
+  }
+
+  const led = readFileSync(join(d, ".bg", "ledger.jsonl"), "utf8");
+  if (/"type":"drop"/.test(led) && /"type":"node"/.test(led)) {
+    ok("账本里留着:声明过 + 后来放弃了(历史不改写)");
+  } else {
+    bad("放弃没有留痕");
+  }
+
+  // 通过过的节点不能直接 drop —— 那会把一段真实的验收历史抹出图外
+  const d2 = newRepo();
+  write(d2, "x.py", "v1\n");
+  sh("git add -A && git -c user.email=a@b -c user.name=a commit -q -m base", d2);
+  bg(d2, ["init"]);
+  bg(d2, ["declare", "--id", "done", "--expect", "x", "--fs-contains", "x.py:v2"]);
+  write(d2, "x.py", "v2\n");
+  bg(d2, ["accept", "done"]);
+  const r2 = bg(d2, ["drop", "done"]);
+  if (r2.code !== 0 && /retract/.test(r2.out)) {
+    ok("通过过的节点不能直接 drop(要先 retract —— 历史不为方便让步)");
+  } else {
+    bad("通过过的节点被直接 drop 了");
+  }
+}
+
 // ================================================================ 收尾
 
 for (const d of tmpdirs) rmSync(d, { recursive: true, force: true });

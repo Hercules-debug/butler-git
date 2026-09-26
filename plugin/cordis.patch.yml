@@ -6,7 +6,8 @@
 #  - `insert:` 用于**新增**条目;不带 insert 的顶层条目是**修改已存在**的条目
 #  - `name` 必须是 Node 可解析的包名,与 package.json 的 name 一致
 #
-# 本插件只注册四个模型工具(node_check / node_declare / node_accept / node_tree),
+# 本插件只注册六个模型工具(node_check / node_declare / node_accept / node_tree /
+# node_health / node_drop),
 # 不改动 DSH 既有条目。
 #
 # 卸载:从 profile 的 dsh.profile.bundles 移除 dsh-butler-git 即可。
