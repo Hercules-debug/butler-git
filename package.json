@@ -1,14 +1,37 @@
 {
-  "name": "butler-git",
+  "name": "dsh-butler-git",
   "version": "0.1.0",
-  "private": true,
-  "type": "module",
   "description": "git 原生的节点门禁:两盏灯(通过过 / 现在过不过),门禁 = 预期文件系统 + 进程情况 + 验证程序",
+  "type": "module",
+  "license": "MIT",
+  "main": "plugin/index.js",
   "bin": {
     "bg": "./bin/bg.mjs"
   },
+  "files": [
+    "plugin",
+    "lib",
+    "bin",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "agent",
+    "verification",
+    "git",
+    "butler"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.0",
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.2"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./plugin/cordis.patch.yml"
+    }
+  },
   "scripts": {
     "test": "node test/run.mjs && node test/plugin.mjs"
-  },
-  "dependencies": {}
+  }
 }

@@ -284,6 +284,37 @@ unreadable   **看不见** —— 观测能力受限,不是事实
 | `node_tree` | 看树(两盏灯) |
 | `node_health` | 心跳一行 |
 
+### 装进 DSH
+
+**仓库根目录就是插件包** —— 因为 `nodeLinker: hoisted` 下 `file:` 依赖是**整目录复制**,
+而插件的 `index.js` 要 `import ../lib/*.mjs`。如果包只圈在 `plugin/` 子目录里,
+复制过去之后 `../lib` 就断了。所以 `package.json` 放在根上,
+`files` 把 `lib` 和 `plugin` 一起带上。
+
+在 profile 的 `package.json` 里加两处:
+
+```jsonc
+{
+  "dependencies": {
+    "dsh-butler-git": "file:/绝对路径/butler-git"   // 本地开发
+    // 或 "github:Hercules-debug/butler-git"       // 从 GitHub 装
+  },
+  "dsh": { "profile": { "bundles": [
+    // ...
+    "dsh-butler-git"
+  ] } }
+}
+```
+
+然后 `pnpm install`(在 profile 目录里)。
+
+本地开发时还要给**自测**准备 peer 软链 —— 运行时 DSH 会提供 peer,
+但 `node test/plugin.mjs` 需要能 import 到它们:
+
+```bash
+cd butler-git && ./plugin/setup-dev-links.sh
+```
+
 ### 逻辑只有一份
 
 ```
@@ -309,6 +340,7 @@ plugin/index.js 模型用的工具
 
 ```
 butler-git/
+├── package.json      **插件包**(main = plugin/index.js;files 带上 lib 和 plugin)
 ├── bin/bg.mjs        命令行(人用)
 ├── lib/
 │   ├── git.mjs       git 原语:树哈希 / 树比对 / 基线跑命令(临时索引 / 临时 worktree)
@@ -319,7 +351,7 @@ butler-git/
 │   ├── nodes.mjs     写路径:声明 / 改写 / 验收 / 作废(所有权 + 不可篡改)
 │   ├── lights.mjs    两盏灯 + 树
 │   └── view.mjs      渲染(只画,不算)
-├── plugin/           DSH 工具插件
+├── plugin/           DSH 工具插件(index.js / cordis.patch.yml)
 └── test/             负向验收(39 条)
 ```
 
