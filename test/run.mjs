@@ -8,7 +8,7 @@
  */
 
 import { spawnSync, spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -624,6 +624,57 @@ head("验收 14:放弃一个从未通过过的计划(BUG-7)");
     ok("通过过的节点不能直接 drop(要先 retract —— 历史不为方便让步)");
   } else {
     bad("通过过的节点被直接 drop 了");
+  }
+}
+
+// ================================================================ 验收 15
+head("验收 15:图是【每个项目一份】的 —— 指错目录不能安静地开一个新图");
+
+// 图存在 `<项目>/.bg/`,而插件默认拿会话 cwd 当项目。
+// 于是"指错目录"是个很现实的失误,而它原来的表现是:
+//
+//     declare -> ok:true,安静地在错的地方建了一个 .bg/,而且没有基线
+//     直到事后某一步才冒出一句"(说明) 没有基线"
+//
+// 这正是最不能忍的那类失败。所以 declare 现在**必须先有基线**。
+{
+  const d = newRepo();
+  write(d, "x.py", "v1\n");
+  sh("git add -A && git -c user.email=a@b -c user.name=a commit -q -m base", d);
+
+  // 没 init 就声明
+  const r = bg(d, ["declare", "--id", "n", "--expect", "x", "--allow", "x.py",
+    "--fs-contains", "x.py:v2"]);
+  if (r.code !== 0 && /没有基线|baseline/.test(r.out)) {
+    ok("没取基线就声明 -> 被拦下");
+  } else {
+    bad(`没基线竟然声明成功了: ${r.out.trim().slice(0, 120)}`);
+  }
+  if (!existsSync(join(d, ".bg"))) {
+    ok("而且**没有偷偷建 .bg/** —— 没有在错的地方新开一个空图");
+  } else {
+    bad("悄悄建了 .bg/ —— 这正是那个静默失败");
+  }
+
+  // 取基线之后就正常
+  bg(d, ["init"]);
+  if (bg(d, ["declare", "--id", "n", "--expect", "x", "--allow", "x.py",
+    "--fs-contains", "x.py:v2"]).code === 0) {
+    ok("取了基线之后声明正常");
+  } else {
+    bad("取了基线还是声明不了");
+  }
+
+  // 反面:同一个仓库,用**错的** project 去读 -> 应该老实说"图是空的",
+  // 而不是把另一个项目的图拿过来。
+  const other = newRepo();
+  write(other, "y.py", "v1\n");
+  sh("git add -A && git -c user.email=a@b -c user.name=a commit -q -m base", other);
+  const v = bg(other, ["view"]);
+  if (/图是空的/.test(v.out) && !/n /.test(v.out)) {
+    ok("另一个项目看到的确实是它自己的空图(图不串项目)");
+  } else {
+    bad(`图串项目了: ${v.out.split("\n")[0]}`);
   }
 }
 
