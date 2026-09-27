@@ -206,9 +206,21 @@ head("4. 弱 P:P 在基线时就通过 -> 要标出来");
   else bad(`弱 P 应该进 trailer,实际:${trail}`);
 }
 
-// ============================================================ 5. 向根负责
+// ============================================================ 5. 所有节点一视同仁
+//
+// **这一节取代了原来的「向根负责」。** 那个模型是:每个子节点达成时额外跑
+// 一遍【根节点的 P】,建立在那条不变式上 ——"每一个绿的 commit 上,根门禁
+// 都是通过的"。
+//
+// 它被删了,因为那个模型是错的:根 P 和子节点的 P 是**同一种东西**
+// (都是"这件事做对了"的证明),它不该下来压每一个子任务。
+//
+// 所以这一节的验收**反过来**:
+//   ① 子节点**不受**根 P 的牵连(根 P 坏着,子节点照样能达成)
+//   ② 根节点自己**照常**受自己的 P 约束(它不特殊)
+//   ③ trailer 里不再有 bg-root-verify
 
-head("5. 向根负责:子节点把根弄坏 -> 不达成");
+head("5. 所有节点一视同仁:子节点不受根 P 牵连,根自己照常受约束");
 {
   const d = newRepo();
   const b = headSha(d);
@@ -217,25 +229,28 @@ head("5. 向根负责:子节点把根弄坏 -> 不达成");
   sh("git commit -qm add-root", d);
   const b2 = headSha(d);
 
-  // 根 P:root.txt 必须是 ok
-  const { token } = seedRoot(d, { verify: "grep -q ok root.txt" });
-  mkNode(d, { id: "n1", parent: "root", token, base: b2, expect: "改坏 root",
+  // 根 P 故意写成**恒失败** —— 用来证明它压不到子节点身上。
+  // (删掉根门禁之前,这里会让 n1 永远达不成。)
+  const { token } = seedRoot(d, { verify: "exit 1" });
+  mkNode(d, { id: "n1", parent: "root", token, base: b2, expect: "n1 自己的活",
     verify: "true", delta: ["M:root.txt"] });
 
-  write(d, "root.txt", "BROKEN\n");
-  let r = bg(d, ["commit", "n1", "--token", token]);
-  if (r.code !== 0 && /根 P 不通过/.test(r.out)) ok("把根弄坏 -> 不提交,并说清要求");
-  else bad(`根被弄坏应该被抓,实际:${r.out}`);
-
-  // 修好根
-  write(d, "root.txt", "ok\n");
-  r = bg(d, ["commit", "n1", "--token", token]);
-  if (r.code !== 0 && /没发生/.test(r.out)) ok("恢复原样 -> Δ 说\"没发生\"(诚实)");
-  else bad(`恢复原样后不该通过,实际:${r.out}`);
+  write(d, "root.txt", "whatever\n");
+  const r = bg(d, ["commit", "n1", "--token", token]);
+  if (r.code === 0) ok("根 P 恒失败,子节点**照样**达成(一视同仁)");
+  else bad(`子节点不该被根 P 牵连,实际:${r.out}`);
 
   const trail = sh("git log -1 --format=%B", d).stdout;
-  if (!/bg-root-verify/.test(trail)) ok("没达成时历史里没有 root-verify trailer");
-  else bad("HEAD 不该有新的达成");
+  if (!/bg-root-verify/.test(trail)) ok("trailer 里**没有** bg-root-verify(那个概念没了)");
+  else bad(`不该再写 bg-root-verify,实际:${trail}`);
+
+  // ② 根自己照常受自己的 P 约束 —— 它不特殊
+  const rc = bg(d, ["commit", "root", "--as-user"]);
+  if (rc.code !== 0 && /P 不通过/.test(rc.out)) {
+    ok("根自己提交 -> 照常跑自己的 P,没过就不过(根不特殊)");
+  } else {
+    bad(`根该被自己的 P 拦住,实际:${rc.out}`);
+  }
 }
 
 // ============================================================ 6. 冻结
