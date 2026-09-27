@@ -6,29 +6,33 @@
  * 所以不存在"两个前端漂移"的问题(上一个实现正是死在这上面:
  * Python 核心和 JS 插件各写一遍,改了一边另一边静默落后)。
  *
- *   bg init                          取基线
- *   bg check --file c.json           只检查一份门禁够不够格
- *   bg declare --file c.json         声明/改写一个节点
- *   bg accept <id>                   跑完整门禁;全过则点亮第一盏灯
- *   bg retract <id> [--reason ...]   作废(追加一条,不改写历史)
- *   bg view [--live] [--detail <id>] 看树(两盏灯)
- *   bg health                        心跳一行
+ * ## 模型的四个工具
+ *
+ *   bg plan     声明一个任务(base / expect / Δ? / P)
+ *   bg status   相对 base 改了什么;和 Δ 比差在哪(便宜,不跑 P)
+ *   bg commit   提交即门禁:Δ + P + 根 P,过了才产生版本
+ *   bg abandon  把一个声明了但没做的任务从图里移除
+ *
+ * ## 人的面(不占模型的工具位)
+ *
+ *   bg tree            看整棵树(灯 + P 原文 + 弱 P 标记 + 图外的提交)
+ *   bg recheck         对当前 commit 复查各历史节点 —— 诊断,不是灯
+ *   bg health          心跳一行
+ *   bg log             从 commit trailer 读出来的历史
  */
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-import { isRepo, head, treeOf, workingTreeHash } from "../lib/git.mjs";
-import * as store from "../lib/store.mjs";
-import { checkContract, checkVacuity } from "../lib/contract.mjs";
-import { declare, accept, retract, drop, normalize } from "../lib/nodes.mjs";
-import { evaluateGate } from "../lib/gate.mjs";
-import { render, renderDetail, healthLine } from "../lib/view.mjs";
+import { head, isRepo } from "../lib/git.mjs";
+import { plan, commit, abandon, normalize } from "../lib/nodes.mjs";
+import { parseDelta } from "../lib/delta.mjs";
+import {
+  renderTree, renderStatus, renderLog, healthLine,
+} from "../lib/view.mjs";
+import { recheck, crossCheck } from "../lib/recheck.mjs";
 
-const REPEATABLE = new Set([
-  "allow", "fs-exists", "fs-absent", "fs-contains", "fs-not-contains", "fs-changed",
-  "proc-present", "proc-absent",
-]);
+const REPEATABLE = new Set(["delta"]);
 
 function parseArgs(argv) {
   const positional = [];
@@ -54,221 +58,155 @@ function parseArgs(argv) {
 
 const asList = (v) => (v === undefined ? [] : Array.isArray(v) ? v : [v]);
 
-/** 从 --file(JSON)或紧凑参数拼一份契约。 */
-function contractFrom({ flags }) {
-  if (flags.file) {
-    const text = flags.file === "-" ? readFileSync(0, "utf8") : readFileSync(flags.file, "utf8");
-    try {
-      return { ok: true, contract: JSON.parse(text) };
-    } catch (e) {
-      return { ok: false, error: `读不了契约 JSON: ${e.message}` };
-    }
-  }
-
-  if (!flags.id && !flags.expect) {
-    return { ok: false, error: "给出契约:--file <路径|-> 或 --id/--expect/... 紧凑参数" };
-  }
-
-  const paths = [
-    ...asList(flags["fs-exists"]).map((path) => ({ kind: "exists", path })),
-    ...asList(flags["fs-absent"]).map((path) => ({ kind: "absent", path })),
-    ...asList(flags["fs-contains"]).map((s) => {
-      // 只切**第一个**冒号 —— pattern 里含冒号是常见的(比如 URL)
-      const i = s.indexOf(":");
-      return i < 0
-        ? { kind: "contains", path: s, pattern: "" }
-        : { kind: "contains", path: s.slice(0, i), pattern: s.slice(i + 1) };
-    }),
-    ...asList(flags["fs-not-contains"]).map((s) => {
-      const i = s.indexOf(":");
-      return i < 0
-        ? { kind: "not_contains", path: s, pattern: "" }
-        : { kind: "not_contains", path: s.slice(0, i), pattern: s.slice(i + 1) };
-    }),
-  ];
-
-  return {
-    ok: true,
-    contract: {
-      id: flags.id,
-      expect: flags.expect ?? "",
-      parent: flags.parent ?? null,
-      owner: flags.owner ?? "model",
-      allow: asList(flags.allow),
-      fs: { paths, changed: asList(flags["fs-changed"]), tree: flags["fs-tree"] ?? null },
-      proc: {
-        present: asList(flags["proc-present"]),
-        absent: asList(flags["proc-absent"]),
-      },
-      verify: flags.verify ?? null,
-    },
-  };
+function die(msg, code = 2) {
+  process.stderr.write(`${msg}\n`);
+  process.exit(code);
 }
 
-const projectDir = (flags) => resolve(flags.project ?? process.cwd());
-const emit = (o) => console.log(JSON.stringify(o, null, 2));
-
-// ------------------------------------------------------------------ 命令
-
-function cmdInit(flags) {
-  const dir = projectDir(flags);
-  if (!isRepo(dir)) {
-    console.log(`基线已取: ${dir}\n  git: 否 —— **文件侧没有保证**(不假装能做到)`);
-    store.saveBaseline(dir, { head: "", tree: null, isRepo: false, ts: store.nowIso() });
-    return 0;
-  }
-  const h = head(dir);
-  const t = treeOf(dir, "HEAD");
-  store.saveBaseline(dir, { head: h, tree: t, isRepo: true, ts: store.nowIso() });
-  store.appendLedger(dir, { type: "init", head: h, tree: t });
-  console.log(`基线已取: ${dir}\n  git: 是  head=${h.slice(0, 12) || "(空仓库)"}  tree=${(t ?? "-").slice(0, 12)}`);
-  return 0;
+function out(lines) {
+  process.stdout.write(`${lines.join("\n")}\n`);
 }
 
-function cmdCheck(flags) {
-  const dir = projectDir(flags);
-  const { ok, contract, error } = contractFrom({ flags });
-  if (!ok) { console.log(error); return 2; }
-  const r = checkContract(dir, normalize(contract));
-  emit({ ok: r.ok, problems: r.problems, notes: r.notes });
-  return r.ok ? 0 : 1;
-}
-
-function cmdDeclare(flags) {
-  const dir = projectDir(flags);
-  const { ok, contract, error } = contractFrom({ flags });
-  if (!ok) { console.log(error); return 2; }
-  const r = declare(dir, contract, { asUser: Boolean(flags["as-user"]) });
-  emit(r.ok
-    ? { ok: true, node: r.node.id, rewrite: r.rewrite, notes: r.notes }
-    : { ok: false, problems: r.problems, owner: r.owner });
-  return r.ok ? 0 : 1;
-}
-
-function cmdAccept(args, flags) {
-  const dir = projectDir(flags);
-  const id = args[0];
-  if (!id) { console.log("用法: bg accept <节点 id>"); return 2; }
-  const r = accept(dir, id, { timeout: Number(flags.timeout ?? 120_000) });
-  if (r.ok) {
-    emit({ ok: true, node: id, evidence: { tree: r.evidence.tree, ts: r.evidence.ts } });
-    return 0;
-  }
-  console.log(`[验收 ${id}] 不通过`);
-  for (const p of r.problems) console.log(`  ✗ ${p}`);
-  return 1;
-}
-
-function cmdRetract(args, flags) {
-  const dir = projectDir(flags);
-  const id = args[0];
-  if (!id) { console.log("用法: bg retract <节点 id>"); return 2; }
-  const r = retract(dir, id, flags.reason ?? "");
-  emit(r);
-  return r.ok ? 0 : 1;
-}
-
-function cmdAssert(args, flags) {
-  const dir = projectDir(flags);
-  const id = args[0];
-  if (!id) { console.log("用法: bg assert <节点 id> [--cheap]"); return 2; }
-  const node = store.getNode(dir, id);
-  if (!node) { console.log(`节点 ${id} 不存在`); return 1; }
-  const mode = flags.cheap ? "cheap" : "full";
-  const r = evaluateGate(dir, node, { mode });
-  for (const i of r.items) {
-    const mark = i.status === "ok" ? "✓" : i.status === "fail" ? "✗" : "?";
-    console.log(`  ${mark} ${i.label}  ${i.detail}`);
-    if (i.demand) console.log(`      -> 要求: ${i.demand}`);
-  }
-  if (r.empty) console.log("  (这个节点没有门禁)");
-  for (const n of r.notes ?? []) console.log(`  (说明) ${n}`);
-  console.log(r.ok ? `[门禁 ${id}] 过` : `[门禁 ${id}] ${r.failed.length ? "不过" : "未复查"}`);
-  return r.ok ? 0 : 1;
-}
-
-function cmdDrop(args, flags) {
-  const dir = projectDir(flags);
-  const id = args[0];
-  if (!id) { console.log("用法: bg drop <节点 id> [--reason ...]"); return 2; }
-  const r = drop(dir, id, flags.reason ?? "");
+/** 输出一个结果:失败就列"要求",成功就列内容。 */
+function emit(r, { okLines = [] } = {}) {
   if (!r.ok) {
-    console.log(`[放弃 ${id}] 不行`);
-    for (const p of r.problems) console.log(`  ✗ ${p}`);
-    return 1;
+    out([...okLines, ...(r.problems ?? []).map((p) => `  ${p}`)]);
+    process.exit(1);
   }
-  console.log(`[放弃 ${id}] 已从图里移出(账本里留着这条记录)`);
-  return 0;
+  out([...(r.lines ?? okLines), ...(r.problems ?? [])]);
 }
 
-function cmdView(flags) {
-  const dir = projectDir(flags);
-  const light2 = flags.live ? "full" : (flags.cheap ? "cheap" : "cheap");
-  if (flags.detail) {
-    console.log(renderDetail(dir, flags.detail, { light2 }));
-    return 0;
-  }
-  console.log(render(dir, { light2, task: flags.task ?? null }));
-  return 0;
-}
+const USAGE = `
+bg —— 节点是「意图」,commit 是「证据」
 
-function cmdHealth(flags) {
-  console.log(healthLine(projectDir(flags)));
-  return 0;
-}
+模型用的四个:
+  bg plan     --id <id> --expect <一句话> --base <sha> --verify <命令>
+              [--parent <id>] [--owner user|model]
+              [--delta "M:src/a.py"]... [--delta-source at-commit]
+  bg status   <id>                    相对 base 改了什么;和 Δ 比差在哪(不跑 P)
+  bg commit   <id> [--timeout <ms>]   提交即门禁:Δ + P + 根 P,过了才产生版本
+  bg abandon  <id> [--reason ...]     把一个声明了但没做的任务从图里移除
 
-function cmdGateInfo(flags) {
-  const dir = projectDir(flags);
-  const t = workingTreeHash(dir);
-  emit({ workingTree: t, head: head(dir), baseline: store.baseline(dir) });
-  return 0;
-}
+人用的:
+  bg tree                 看整棵树(灯 + P 原文 + 弱 P 标记 + 图外的提交)
+  bg recheck  [--full]    对当前 commit 复查各历史节点(诊断,不是灯)
+  bg health               心跳一行
+  bg log                  从 commit trailer 读出来的历史
+  bg crosscheck           图和 commit 对不对得上
 
-// ------------------------------------------------------------------ main
-
-const HELP = `bg —— git 原生的节点门禁
-
-  init                              取基线
-  check   --file c.json             只检查门禁够不够格(不写入)
-  declare --file c.json [--as-user] 声明/改写一个节点
-  accept  <id> [--timeout ms]       跑完整门禁;全过则点亮第一盏灯
-  assert  <id> [--cheap]            门禁现在过不过(默认全跑)
-  retract <id> [--reason ...]       作废(追加一条,不改写历史)
-  drop    <id> [--reason ...]       放弃一个**从未通过过**的计划(移出图,留账)
-  view    [--live] [--detail <id>]  看树(两盏灯)
-  health                            心跳一行
-  treeinfo                          当前工作区树哈希 / 基线
-
-全局: --project <目录>
-`;
+全局:  --dir <路径>   默认是当前目录
+`.trim();
 
 function main() {
-  const argv = process.argv.slice(2);
-  const { positional, flags } = parseArgs(argv);
-  const cmd = positional.shift();
+  const { positional, flags } = parseArgs(process.argv.slice(2));
+  const cmd = positional[0];
+  const dir = resolve(flags.dir ?? ".");
 
-  switch (cmd) {
-    case "init": return cmdInit(flags);
-    case "check": return cmdCheck(flags);
-    case "declare": return cmdDeclare(flags);
-    case "accept": return cmdAccept(positional, flags);
-    case "assert": return cmdAssert(positional, flags);
-    case "retract": return cmdRetract(positional, flags);
-    case "drop": return cmdDrop(positional, flags);
-    case "view": return cmdView(flags);
-    case "health": return cmdHealth(flags);
-    case "treeinfo": return cmdGateInfo(flags);
-    case "vacuity": {
-      const dir = projectDir(flags);
-      const { ok, contract, error } = contractFrom({ flags });
-      if (!ok) { console.log(error); return 2; }
-      emit(checkVacuity(dir, normalize(contract)));
-      return 0;
-    }
-    default:
-      console.log(HELP);
-      return cmd ? 2 : 0;
+  if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
+    out([USAGE]);
+    process.exit(0);
   }
+
+  if (cmd === "health") {
+    out([healthLine(dir)]);
+    return;
+  }
+
+  if (cmd === "tree") {
+    emit(renderTree(dir));
+    return;
+  }
+
+  if (cmd === "log") {
+    emit(renderLog(dir));
+    return;
+  }
+
+  if (cmd === "crosscheck") {
+    const issues = crossCheck(dir);
+    if (!issues.length) out(["图和 commit 对得上。"]);
+    else {
+      out(["图和 commit **对不上**:", ...issues.map((i) => `  ✗ ${i}`)]);
+      process.exit(1);
+    }
+    return;
+  }
+
+  if (cmd === "recheck") {
+    const r = recheck(dir, { mode: flags.full ? "full" : "delta" });
+    out(r.lines);
+    if (!r.ok) process.exit(1);
+    return;
+  }
+
+  if (cmd === "status") {
+    const id = positional[1];
+    if (!id) die("用法: bg status <id>");
+    emit(renderStatus(dir, id));
+    return;
+  }
+
+  if (cmd === "abandon") {
+    const id = positional[1];
+    if (!id) die("用法: bg abandon <id> [--reason ...]");
+    const r = abandon(dir, id, typeof flags.reason === "string" ? flags.reason : "");
+    if (!r.ok) die((r.problems ?? ["放弃失败"]).join("\n"));
+    out([`已放弃 ${id}${typeof flags.reason === "string" ? ` (${flags.reason})` : ""} —— 它不在图里了。`]);
+    return;
+  }
+
+  if (cmd === "commit") {
+    const id = positional[1];
+    if (!id) die("用法: bg commit <id> [--timeout <ms>]");
+    const r = commit(dir, id, {
+      timeout: Number(flags.timeout ?? 120_000),
+    });
+    if (!r.ok) {
+      out(r.problems.map((p) => `  ${p}`));
+      process.exit(1);
+    }
+    out([
+      `● ${id} 达成 —— 证据 ${String(r.result).slice(0, 8)}`,
+      `  验过的树 ${String(r.tree).slice(0, 8)}(和 commit 的内容一个字节都不差)`,
+      ...(r.weak_verify === true
+        ? ["  ⚠ 这条 P 在基线时就通过 —— 它区分不了你做没做"] : []),
+      ...(r.notes ?? []),
+    ]);
+    return;
+  }
+
+  if (cmd === "plan") {
+    const raw = {
+      id: flags.id,
+      expect: flags.expect,
+      base: flags.base,
+      parent: flags.parent ?? null,
+      owner: flags.owner ?? "model",
+      delta: parseDelta(asList(flags.delta)),
+      delta_source: flags["delta-source"] ?? null,
+      verify: flags.verify ?? null,
+    };
+    const r = plan(dir, normalize(raw), { asUser: flags["as-user"] === true });
+    if (!r.ok) {
+      out(r.problems.map((p) => `  ✗ ${p}`));
+      process.exit(1);
+    }
+    const n = r.node;
+    out([
+      `${r.rewrite ? "改写" : "声明"}了 ${n.id}`,
+      `  expect  ${n.expect}`,
+      `  base    ${String(n.base).slice(0, 8)}`,
+      `  Δ       ${n.delta.length ? n.delta.map((d) => `${d.code} ${d.path}`).join("  ") : "(空 —— 没有任何东西防止意外改动)"}`,
+      `  P       ${n.verify}`,
+    ]);
+    return;
+  }
+
+  die(`不认识的命令 "${cmd}"\n\n${USAGE}`);
 }
 
-process.exit(main());
+try {
+  main();
+} catch (e) {
+  die(`bg 崩了: ${e.stack ?? e.message}`, 3);
+}

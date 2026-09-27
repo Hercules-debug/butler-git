@@ -1,7 +1,7 @@
 {
   "name": "dsh-butler-git",
   "version": "0.1.0",
-  "description": "git 原生的节点门禁:两盏灯(通过过 / 现在过不过),门禁 = 预期文件系统 + 进程情况 + 验证程序",
+  "description": "git 原生的节点门禁:节点是「意图」,commit 是「证据」—— Δ(预期变化)+ P(检测程序)+ 根门禁,过了才提交",
   "type": "module",
   "license": "MIT",
   "main": "plugin/index.js",

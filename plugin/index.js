@@ -1,11 +1,11 @@
 /**
- * dsh-butler-git —— git 原生的节点门禁,做成 DSH 工具。
+ * dsh-butler-git —— 节点是「意图」,commit 是「证据」。做成 DSH 工具。
  *
  * ## 三个概念
  *
- *     节点   一个步骤。它带一份**门禁**。
- *     门禁   预期文件系统 + 进程情况 + 验证程序。**三条全过才算"现在过"。**
- *     两盏灯  第一盏"通过过"(历史,不可变) 第二盏"现在过不过"(当下,参考)
+ *     节点    一个意图(你要达成什么)。它带 Δ(预期变化)和 P(检测程序)
+ *     commit  达成时留下的**证据**。不可变,可重放
+ *     绿      一个关于某个 commit 的事实 —— 所以永不过时
  *
  * ## 为什么做成工具,而不是让模型拼 bash
  *
@@ -21,13 +21,19 @@
  * 这一条是刻意的,而且是有代价换来的:上一个实现把核心写了两遍
  * (Python 一份、JS 一份),改了一边另一边静默落后 ——
  * 于是"模型用的那半边没有新门禁"。**逻辑只写一次,两个前端只是渲染。**
+ *
+ * ## 为什么只有四个工具
+ *
+ * 上一版 25 个是负担 —— 模型会挑一个差不多的用,或者开始乱试。
+ * "看树"和"合并"都不该占模型的工具位:树用 `git log` 看,
+ * 合并折进 `node_commit`(检测到 MERGE_HEAD 就走合并分支)。
  */
 
 import { defineTool } from "@deepseek-ai/dsh-tools";
 
-import { checkContract } from "../lib/contract.mjs";
-import { declare, accept, drop, normalize } from "../lib/nodes.mjs";
-import { render, renderDetail, healthLine } from "../lib/view.mjs";
+import { plan, commit, abandon, normalize } from "../lib/nodes.mjs";
+import { parseDelta } from "../lib/delta.mjs";
+import { renderStatus } from "../lib/view.mjs";
 
 /** 插件的 Cordis 名称。 */
 export const name = "butler-git-tools";
@@ -43,9 +49,6 @@ export const inject = ["tools"];
 /**
  * 会话的工作区 —— 所有状态都在它的 `.bg/` 下。
  *
- * 插件拿到的 ctx 没有 agent scope(所以是全局注册),
- * 但 execute 里能拿到 exec,那里有会话的 cwd。
- *
  * ## 为什么参数能覆盖它(BUG-4)
  *
  * 原来这里**写死**会话 cwd,而且工具的参数表里没有 `project`。
@@ -59,105 +62,15 @@ function projectOf(exec, args) {
   return args?.project ?? exec?.agent?.session?.header?.cwd ?? process.cwd();
 }
 
-// ---------------------------------------------------------------- 参数表
-
-/** 每个工具都带的 `project`。见上面 `projectOf` 那段。 */
 const PROJECT_PARAM = {
   project: {
     type: "string",
     description:
-      "工作目录(默认 = 会话 cwd)。图和账本都在它的 .bg/ 下。"
+      "工作目录(默认 = 会话 cwd)。图在它的 .bg/ 下。"
       + "**当你要操作的项目不是你当前所在的目录时,必须显式给这个参数** —— "
       + "否则工具会去找会话 cwd 的 .bg/,看不见你在别处声明的节点。",
   },
 };
-
-/**
- * 门禁的紧凑参数。**file_contains 是两段,只切第一个冒号** ——
- * 所以 pattern 里含冒号(URL、时间戳)不会被切坏。
- */
-const GATE_PARAMS = {
-  stepId: {
-    type: "string",
-    required: true,
-    description: "节点 id,自己起一个,如 n-001。同一个 id 再声明 = 改这份门禁(改有前提,见下)",
-  },
-  expectation: {
-    type: "string",
-    required: true,
-    description: "一句话说清这一步要达成什么。这是执行者判断'怎么做才合理'的依据",
-  },
-  parent: {
-    type: "string",
-    description: "父节点 id。给了就加入那个任务;不给就是新任务",
-  },
-  owner: {
-    type: "string",
-    description:
-      "user = 人和模型约定的验收(模型改不动它); model = 你自己拆的(默认,可以自己改)",
-  },
-  allow: {
-    type: "array",
-    items: { type: "string" },
-    description: "可写边界(工作区相对路径通配),如 ['src/**']",
-  },
-  fsExists: {
-    type: "array",
-    items: { type: "string" },
-    description: "【预期文件系统】这些路径必须**存在**。直接 stat,免疫 .gitignore",
-  },
-  fsAbsent: {
-    type: "array",
-    items: { type: "string" },
-    description: "【预期文件系统】这些路径必须**不存在**(别留下垃圾)。单靠它不构成门禁",
-  },
-  fsContains: {
-    type: "array",
-    items: { type: "string" },
-    description: "【预期文件系统】'路径:字面串' —— 该文件必须包含这串字。只切第一个冒号",
-  },
-  fsNotContains: {
-    type: "array",
-    items: { type: "string" },
-    description: "【预期文件系统】'路径:字面串' —— 该文件必须**不含**这串字",
-  },
-  fsChanged: {
-    type: "array",
-    items: { type: "string" },
-    description:
-      "【预期文件系统】这些路径的内容必须**和开工时不同**(增量谓词)。"
-      + "**不要求内容是什么** —— 它只回答'动过没有'。\n"
-      + "注意两点:(1) 它只认'改',不认'创建/删除' —— 那两种用 fsExists / fsAbsent,"
-      + "因为它们**带方向**,而 changed 会把方向和反方向说成同一件事;"
-      + "(2) 它是**相对判据**,允许任何改变,包括把文件清空 —— "
-      + "所以它不能单独用,内容对不对要靠 fsContains 或 fsTree。",
-  },
-  fsTree: {
-    type: "string",
-    description:
-      "【预期文件系统】整个世界必须等于这个 git 树哈希(绝对判据)。"
-      + "注意:.gitignore 的路径它看不见,所以编译产物那类别用它,用 fsExists",
-  },
-  procPresent: {
-    type: "array",
-    items: { type: "string" },
-    description: "【进程情况】这些进程应当**在跑**",
-  },
-  procAbsent: {
-    type: "array",
-    items: { type: "string" },
-    description: "【进程情况】这些进程应当**已关闭**。单靠它不构成门禁",
-  },
-  verify: {
-    type: "string",
-    description:
-      "【验证程序】一条命令,退出码 0 才算过。这是门禁里最强的一半 —— "
-      + "它验行为,前面那些只验痕迹。**它必须在基线时跑不过**,否则它等于没验",
-  },
-};
-
-/** 门禁参数 + 每个工具都要的 project。 */
-const GATE_PARAMS_WITH_PROJECT = { ...GATE_PARAMS, ...PROJECT_PARAM };
 
 const OUTPUT = {
   type: "object",
@@ -169,234 +82,238 @@ const OUTPUT = {
   },
 };
 
-function renderText(v) {
-  return [v.summary, ...(v.lines ?? [])].join("\n");
-}
+const renderText = (v) => [v.summary, ...(v.lines ?? [])].join("\n");
 
-/** 把工具参数拼成一份契约。和 CLI 的紧凑形式**同一套语义**。 */
-function contractFromArgs(args) {
-  const split = (s) => {
-    const i = s.indexOf(":");
-    return i < 0
-      ? { path: s, pattern: "" }
-      : { path: s.slice(0, i), pattern: s.slice(i + 1) };
-  };
-
-  const paths = [
-    ...(args.fsExists ?? []).map((path) => ({ kind: "exists", path })),
-    ...(args.fsAbsent ?? []).map((path) => ({ kind: "absent", path })),
-    ...(args.fsContains ?? []).map((s) => ({ kind: "contains", ...split(s) })),
-    ...(args.fsNotContains ?? []).map((s) => ({ kind: "not_contains", ...split(s) })),
-  ];
-
-  return normalize({
-    id: args.stepId,
-    expect: args.expectation,
-    parent: args.parent ?? null,
-    owner: args.owner ?? "model",
-    allow: args.allow ?? [],
-    fs: { paths, changed: args.fsChanged ?? [], tree: args.fsTree ?? null },
-    proc: {
-      present: args.procPresent ?? [],
-      absent: args.procAbsent ?? [],
-    },
-    verify: args.verify ?? null,
-  });
-}
-
-function brief(problems, notes) {
-  return [
-    ...(problems ?? []).map((p) => `  ✗ ${p}`),
-    ...(notes ?? []).map((n) => `  (说明) ${n}`),
-  ];
+function brief(problems) {
+  return (problems ?? []).map((p) => `  ${p}`);
 }
 
 // ------------------------------------------------------------------ 工具
 
 export function apply(ctx) {
-  // ---------------------------------------------------------- 自检
+  // ---------------------------------------------------------- 1. plan
   ctx.tools.register(
     defineTool({
-      name: "node_check",
+      name: "node_plan",
       description:
-        "写门禁**之前**自检:这份门禁够格吗。不通过就返回原因,改完再跑。\n"
+        "声明一个任务(**意图**)。它不跑任何验证,只把「要达成什么」记下来 —— "
+        + "所以人看得见你的计划。\n"
         + "\n"
-        + "一个门禁 = 三部分,三部分都可以为空,但不能全空:\n"
-        + "  fs      预期文件系统   fsExists / fsAbsent / fsContains / fsNotContains / fsTree\n"
-        + "  proc    进程情况       procPresent / procAbsent\n"
-        + "  verify  验证程序       一条命令,退出码 0 才算过\n"
+        + "三个必填:\n"
+        + "  id      自己起一个,如 n7\n"
+        + "  expect  一句话:要达成什么。**它同时就是 commit message**\n"
+        + "  base    从哪个 commit 开始(**必须显式给**,我不猜默认值)\n"
+        + "  verify  P:检测程序,一条命令,退出码 0 才算过。**必须有**\n"
         + "\n"
-        + "它会挡三件事:\n"
-        + "  · **整个门禁在基线时就成立** —— 那它在开工前就是绿的,等于没有门禁\n"
-        + "    (最典型:`verify: \"true\"` —— 永远退出 0,什么都没验)\n"
-        + "  · 自相矛盾(present 和 absent 同一个名字;既要求存在又要求不存在)\n"
-        + "  · 只有'不许留下什么'这类安全网,没有任何会失败的东西\n"
-        + "\n"
-        + "注意 check 只看门禁本身,**不看世界**。想知道某个节点现在过不过,用 node_accept。",
-      parameters: GATE_PARAMS_WITH_PROJECT,
-      output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
-      async execute(args, exec) {
-        const dir = projectOf(exec, args);
-        const c = contractFromArgs(args);
-        const r = checkContract(dir, c);
-        return {
-          ok: r.ok,
-          summary: r.ok ? `check: 通过,可以 declare` : "check 不通过",
-          lines: brief(r.problems, r.notes),
-        };
-      },
-    }),
-  );
-
-  // ---------------------------------------------------------- 声明
-  ctx.tools.register(
-    defineTool({
-      name: "node_declare",
-      description:
-        "把一个节点连同它的门禁写进图。它会**再检查一遍** —— 所以先让 node_check 通过。\n"
+        + "delta(Δ)= 预期变化,精确集合,带方向:\n"
+        + "  \"M:src/a.py\"          改了\n"
+        + "  \"A:src/b.py\"          新增\n"
+        + "  \"D:src/c.py\"          删除\n"
+        + "  \"R:src/c.py:src/d.py\" 重命名\n"
+        + "  **精确等于**:少了=漏做,多了=预期外的改动,类型不符=做错方向。\n"
+        + "  不给 = 空。**空不是'没改动',是'没预测'** —— 那就没有任何东西防止意外改动。\n"
         + "\n"
         + "两道门(会在改的时候拦你):\n"
-        + "\n"
-        + "  1. **通过过的节点,门禁冻结。** 要变,起一个**新节点**把改动做出来 ——\n"
-        + "     历史不改写,旧节点保持'通过过'。这不是限制,是因为绿是历史事实:\n"
-        + "     回头改门禁 = 让当时的验收变成一句没法核对的话。\n"
-        + "  2. **owner=user 且已经有一份门禁** -> 你改不动,要人授权。\n"
-        + "     那是人和模型约定的验收,不是你自己拆的手段。",
-      parameters: GATE_PARAMS_WITH_PROJECT,
+        + "  1. **达成过的节点,门禁冻结。** 要变,起一个新节点 —— 历史不改写。\n"
+        + "  2. owner=user 且已经有一份门禁 -> 你改不动,要人授权。",
+      parameters: {
+        id: {
+          type: "string",
+          required: true,
+          description: "节点 id,自己起一个,如 n7",
+        },
+        expect: {
+          type: "string",
+          required: true,
+          description: "一句话:要达成什么。它同时就是 commit message",
+        },
+        base: {
+          type: "string",
+          required: true,
+          description:
+            "**初始 commit 的 sha,必须显式给。** \"从这个版本开始做\"。"
+            + "用 `git rev-parse HEAD` 拿到当前的。不填默认值 —— "
+            + "默认会让 Δ 的语义变模糊。",
+        },
+        verify: {
+          type: "string",
+          required: true,
+          description:
+            "**检测程序 P**:一条命令,退出码 0 才算过。必须有 —— "
+            + "Δ 只管\"改的是不是这些文件\",没有 P 就没有任何东西说\"改对了\"。",
+        },
+        parent: {
+          type: "string",
+          description: "父节点 id。不给 = 这是**根**节点(它的 P 会变成所有人的根门禁)",
+        },
+        owner: {
+          type: "string",
+          description:
+            "user = 人和模型约定的验收(模型改不动它);model = 你自己拆的(默认)",
+        },
+        delta: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "预期变化。**\"方向:路径\"**,如 [\"M:src/a.py\", \"A:src/b.py\"]。"
+            + "实际改动必须**精确等于**它 —— 少了是漏做,多了是预期外的改动。",
+        },
+        delta_source: {
+          type: "string",
+          description:
+            "before-work(默认)= 动手前声明的,真的能拦住方向性错误;"
+            + "at-commit = 提交时照着 git status 抄的,只能拦住\"忘了说\"。",
+        },
+        ...PROJECT_PARAM,
+      },
       output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
       async execute(args, exec) {
         const dir = projectOf(exec, args);
-        const c = contractFromArgs(args);
-        // **绝不传 asUser。** 模型不能自己授权自己改人定的验收。
-        const r = declare(dir, c, { asUser: false });
+        const r = plan(dir, normalize({
+          id: args.id,
+          expect: args.expect,
+          base: args.base,
+          parent: args.parent ?? null,
+          owner: args.owner ?? "model",
+          delta: parseDelta(args.delta ?? []),
+          delta_source: args.delta_source ?? null,
+          verify: args.verify ?? null,
+        }), { asUser: false });
+
+        if (!r.ok) {
+          return { ok: false, summary: "plan 不通过", lines: brief(r.problems) };
+        }
+        const n = r.node;
+        return {
+          ok: true,
+          summary: `${r.rewrite ? "改写" : "声明"}了 ${n.id}`,
+          lines: [
+            `  expect  ${n.expect}`,
+            `  base    ${String(n.base).slice(0, 8)}`,
+            `  Δ       ${n.delta.length
+              ? n.delta.map((d) => `${d.code} ${d.path}`).join("  ")
+              : "(空 —— 没有任何东西防止意外改动)"}`,
+            `  P       ${n.verify}`,
+          ],
+        };
+      },
+    }),
+  );
+
+  // ---------------------------------------------------------- 2. status
+  ctx.tools.register(
+    defineTool({
+      name: "node_status",
+      description:
+        "看这个节点:相对 base 改了什么,**和 Δ 比差在哪**。**不跑 P** —— "
+        + "和 git status 一样便宜,随时可以调。\n"
+        + "\n"
+        + "它同时服务三件事:**写 Δ、自查、理解为什么没过**。输出直接对着 Δ 的形状:\n"
+        + "  ✓ 声明了,也确实发生了\n"
+        + "  ✗ 声明了但没发生(漏做)/ 方向不对(该删的改了)\n"
+        + "  + **多出来的 —— 预期外的改动**  <- 这条最重要,你自己看不见它\n"
+        + "\n"
+        + "想提交之前先跑它。",
+      parameters: {
+        id: { type: "string", required: true, description: "节点 id" },
+        ...PROJECT_PARAM,
+      },
+      output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
+      async execute(args, exec) {
+        const dir = projectOf(exec, args);
+        const r = renderStatus(dir, args.id);
         return {
           ok: r.ok,
-          summary: r.ok
-            ? `declare: ${r.rewrite ? "改写" : "新增"}了 ${r.node.id}`
-            : "declare 不通过",
-          lines: brief(r.problems, r.notes),
+          summary: r.ok ? `status ${args.id}` : `status ${args.id} 出错`,
+          lines: r.lines,
         };
       },
     }),
   );
 
-  // ---------------------------------------------------------- 验收
+  // ---------------------------------------------------------- 3. commit
   ctx.tools.register(
     defineTool({
-      name: "node_accept",
+      name: "node_commit",
       description:
-        "**验收**:跑完整门禁(含验证程序)。三条全过 -> 点亮第一盏灯「通过过」。\n"
+        "**提交即门禁**:Δ + P + 根 P,全过才产生一个版本(commit)。**不过就不提交。**\n"
         + "\n"
-        + "这是唯一能点亮第一盏灯的动作。它不说话、只看事实:\n"
-        + "  - 有断言不过 -> 逐条告诉你 **要求** 做什么\n"
-        + "  - 有东西**看不见**(比如沙箱读不到进程命令行)-> 报「不知道」,\n"
-        + "    **不算通过**,也不当成不通过\n"
+        + "顺序:先固定工作区的树 Y -> 在 Y 上跑 P -> 过了才用 commit-tree 精确提交 Y。\n"
+        + "所以 commit 的内容**就是**被验过的那个内容,一个字节都不差 —— "
+        + "验证程序留下的临时产物进不去。\n"
         + "\n"
-        + "做完一步就跑它,直到通过再报告 —— 不要等人来告诉你没过。",
+        + "三种结果:ok(确实满足)/ fail(不满足,附一条**要求**,你照着修)/ "
+        + "unknown(**不知道** —— 观测受限,**不算通过**)。\n"
+        + "\n"
+        + "**合并也是一次提交**:你先 `git merge --no-commit <父们>` 并自己解决冲突,"
+        + "然后调它。它会查:结果是所有父的后代、每个父的 Δ 在合并后仍然成立"
+        + "(防\"解决冲突时把另一个分支的成果整个撤销掉\")、P 在结果上通过。\n"
+        + "\n"
+        + "达成之后门禁**冻结** —— 要变就起一个新节点。",
       parameters: {
-        stepId: { type: "string", required: true, description: "要验收的节点 id" },
-        timeout: { type: "number", description: "验证程序的超时(毫秒),默认 120000" },
+        id: { type: "string", required: true, description: "节点 id" },
+        timeout: {
+          type: "number",
+          description: "P 的超时(毫秒),默认 120000",
+        },
         ...PROJECT_PARAM,
       },
       output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
       async execute(args, exec) {
         const dir = projectOf(exec, args);
-        const r = accept(dir, args.stepId, { timeout: args.timeout ?? 120_000 });
-        if (r.ok) {
+        const r = commit(dir, args.id, { timeout: Number(args.timeout ?? 120_000) });
+
+        if (!r.ok) {
           return {
-            ok: true,
-            summary: `[验收 ${args.stepId}] 通过 —— 第一盏灯已点亮`,
-            lines: [`  证据锚  树=${(r.evidence.tree ?? "(拿不到)").slice(0, 12)}  时间=${r.evidence.ts}`],
+            ok: false,
+            summary: `${args.id} **没有提交** —— 门禁没过`,
+            lines: brief(r.problems),
           };
         }
         return {
-          ok: false,
-          summary: `[验收 ${args.stepId}] 不通过`,
-          lines: (r.problems ?? []).map((p) => `  ✗ ${p}`),
+          ok: true,
+          summary: `● ${args.id} 达成 —— 证据 ${String(r.result).slice(0, 8)}`,
+          lines: [
+            `  验过的树 ${String(r.tree).slice(0, 8)}(和 commit 的内容一个字节都不差)`,
+            ...(r.weak_verify === true
+              ? ["  ⚠ 这条 P 在基线时就通过 —— 它区分不了你做没做"] : []),
+            ...(r.notes ?? []),
+          ],
         };
       },
     }),
   );
 
-  // ---------------------------------------------------------- 看灯
+  // ---------------------------------------------------------- 4. abandon
   ctx.tools.register(
     defineTool({
-      name: "node_tree",
+      name: "node_abandon",
       description:
-        "看整棵树。每个节点**两盏灯**:\n"
+        "把一个**声明了但没做**的任务从图里移除。\n"
         + "\n"
-        + "    第一盏  通过过没有   历史,不可变,读账本\n"
-        + "    第二盏  现在过不过   当下,跑检查,只是参考\n"
+        + "为什么必须有:plan 把意图记下来了,人看得见它;声明了不做,"
+        + "那条记录就必须能被移除 —— 否则图里永远挂着一个待办,"
+        + "而图看起来像还在做这件事。\n"
         + "\n"
-        + "  ●●  通过过,现在也对\n"
-        + "  ●○  通过过,但现在已经坏了   <- **回归**,最该看一眼的\n"
-        + "  ○●  没通过过,但现在能过\n"
-        + "  ○○  没通过过,现在也不过\n"
-        + "  ·   第二盏没算(它是参考,默认不跑命令)\n"
-        + "  –   没有门禁\n"
+        + "**它只做一件事:从图里移除声明。**\n"
+        + "\"把工作区撤回去\"不是它的职责 —— 那是 `git reset --hard <base>`,你自己有 bash。\n"
         + "\n"
-        + "`live=true` 会连验证程序一起跑,给出完整的第二盏灯 ——\n"
-        + "东西坏掉的时候,它能**指出是哪个节点坏的**,不用你猜。",
+        + "已经达成的节点不能放弃(历史不改写)。要改,起一个新节点。",
       parameters: {
-        live: { type: "boolean", description: "连验证程序一起跑(贵,但完整)" },
-        detail: { type: "string", description: "展开某个节点的细节(门禁逐条 + 证据锚)" },
+        id: { type: "string", required: true, description: "节点 id" },
+        reason: { type: "string", description: "为什么放弃(会记进账本)" },
         ...PROJECT_PARAM,
       },
       output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
       async execute(args, exec) {
         const dir = projectOf(exec, args);
-        const mode = args.live ? "full" : "cheap";
-        if (args.detail) {
-          return {
-            ok: true,
-            summary: renderDetail(dir, args.detail, { light2: mode }),
-            lines: [],
-          };
-        }
-        return { ok: true, summary: render(dir, { light2: mode }), lines: [] };
-      },
-    }),
-  );
-
-  // 心跳(给人看的,也顺手给模型一个"现在什么状态")。
-  ctx.tools.register(
-    defineTool({
-      name: "node_health",
-      description: "心跳一行:有多少节点还没通过过。**只报第一盏灯**(便宜、永远算得起)。",
-      parameters: { ...PROJECT_PARAM },
-      output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
-      async execute(_args, exec) {
-        return { ok: true, summary: healthLine(projectOf(exec, _args)), lines: [] };
-      },
-    }),
-  );
-
-  // 放弃一个计划。
-  ctx.tools.register(
-    defineTool({
-      name: "node_drop",
-      description:
-        "**放弃一个从未通过过的计划**,把它从图里移出(账本里留着这条记录)。\n"
-        + "\n"
-        + "什么时候用:你为一个想法声明了节点,后来**决定不做了** ——\n"
-        + "期望本身不对、或者发现有现成实现、或者方向换了。\n"
-        + "\n"
-        + "**不要用改写来假装它还在**(那会让图看起来像「还在做这件事」)。\n"
-        + "也不必为了让它不红而硬凑一个通过 —— 那是自欺。\n"
-        + "\n"
-        + "通过过的节点不能直接 drop:先 retract 收回它(那条历史会留在账本里)。",
-      parameters: {
-        stepId: { type: "string", required: true, description: "要放弃的节点 id" },
-        reason: { type: "string", description: "为什么放弃 —— 写下来,它会进账本" },
-        ...PROJECT_PARAM,
-      },
-      output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
-      async execute(args, exec) {
-        const dir = projectOf(exec, args);
-        const r = drop(dir, args.stepId, args.reason ?? "");
-        return r.ok
-          ? { ok: true, summary: `[放弃 ${args.stepId}] 已从图里移出(账本里留着)`, lines: [] }
-          : { ok: false, summary: `[放弃 ${args.stepId}] 不行`, lines: r.problems.map((p) => `  ✗ ${p}`) };
+        const r = abandon(dir, args.id, args.reason ?? "");
+        if (!r.ok) return { ok: false, summary: "abandon 不通过", lines: brief(r.problems) };
+        return {
+          ok: true,
+          summary: `已放弃 ${args.id} —— 它不在图里了`,
+          lines: args.reason ? [`  理由: ${args.reason}`] : [],
+        };
       },
     }),
   );
