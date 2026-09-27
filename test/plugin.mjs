@@ -43,6 +43,15 @@ const CORDIS_API = new Set([
 
 const accessed = new Set();
 const services = { tools: { register(def) { registered.push(def); } } };
+
+// 审批服务的**开关**。默认不提供 —— 于是"没有通道 = fail-closed"
+// 是默认被测到的状态(下面那些"插件不能建根"的断言依赖它)。
+// 要测"人点了允许"的路径,就在那个测试块里临时装上再拆掉。
+let approvalsAsked = 0;
+let approvalOutcome = "allowed-once";
+const approvalStub = {
+  request: async () => { approvalsAsked += 1; return approvalOutcome; },
+};
 const ctx = new Proxy({}, {
   get(_t, prop) {
     if (typeof prop === "symbol") return undefined;
@@ -160,15 +169,109 @@ const ROOT_TOKEN = `${seed.stdout ?? ""}`.match(/凭证\s+(\w+)/)?.[1];
 if (ROOT_TOKEN) ok("根节点由**人**创建,拿到凭证(插件没这个开关)");
 else bad(`人建根应该拿到凭证: ${(seed.stdout ?? "") + (seed.stderr ?? "")}`.slice(0, 200));
 
-// 插件**不能**建根节点
+// 插件**不能**建根节点。
+//
+// 判据:要么直接说"只能由人签发",要么走进审批通道而**没拿到**
+// (测试的 ctx 没有 approval 服务 -> fail-closed)。
+// 两条路都必须 ok:false —— 关键是**没授权就不能建根**,
+// 而不是错误信息长什么样。措辞会变,是非不能变。
 const noRoot = await call("node_plan", {
   id: "p-root", expect: "我想建个根", base: BASE, verify: "true",
 });
-if (noRoot.ok === false && /只能由\*\*人\*\*签发/.test(noRoot.lines.join())) {
-  ok("插件建根节点 -> 拒绝(模型不能自己签发)");
+if (noRoot.ok === false && /人的授权|只能由\*\*人\*\*签发/.test(noRoot.lines.join("").replace(/\*\*/g, ""))) {
+  ok("插件建根节点 -> 拒绝(没拿到人的授权,就没建)");
 } else {
   bad(`插件不该能建根: ${JSON.stringify(noRoot).slice(0, 200)}`);
 }
+
+// --- 提权:根节点向**人**要授权(弹窗),子节点永远不打扰人 -------------------
+//
+// 这是这次改动的核心,所以要分四种结果各测一遍:
+//   人点允许 / 人拒绝 / 取消 / 没有通道(fail-closed)
+// 外加一条**否定验收**:子节点操作一次都不该弹窗。
+
+console.log("\n1b. 提权:根向人要,子节点不打扰人");
+
+const rootBase = BASE;
+
+// (1) 人点了"允许" -> 这次放行(applies once)
+approvalsAsked = 0;
+approvalOutcome = "allowed-once";
+services.approval = approvalStub;
+let esc = await call("node_plan", {
+  id: "p-esc", expect: "弹窗允许后建根", base: rootBase, verify: "true",
+});
+if (esc.ok === true && approvalsAsked === 1) {
+  ok("人要授权 -> 弹窗 -> allowed-once -> 这次放行");
+} else {
+  bad(`允许后应该能建根: asked=${approvalsAsked} ${JSON.stringify(esc).slice(0, 160)}`);
+}
+
+// (2) 人点了"拒绝"
+approvalsAsked = 0;
+approvalOutcome = "rejected";
+esc = await call("node_plan", {
+  id: "p-esc2", expect: "弹窗拒绝后不该建", base: rootBase, verify: "true",
+});
+if (esc.ok === false && approvalsAsked === 1 && /人拒绝/.test(esc.lines.join())) {
+  ok("人拒绝 -> 不执行,并说清是**人拒绝了**");
+} else {
+  bad(`拒绝后不该建根: ${JSON.stringify(esc).slice(0, 160)}`);
+}
+
+// (3) 取消
+approvalOutcome = "cancelled";
+esc = await call("node_plan", {
+  id: "p-esc3", expect: "取消", base: rootBase, verify: "true",
+});
+if (esc.ok === false && /取消/.test(esc.lines.join())) ok("授权被取消 -> 不执行");
+else bad(`取消后不该建根: ${JSON.stringify(esc).slice(0, 160)}`);
+
+// (4) 应答者不可用(fail-closed)
+approvalOutcome = "unavailable";
+esc = await call("node_plan", {
+  id: "p-esc4", expect: "不可用", base: rootBase, verify: "true",
+});
+if (esc.ok === false && /fail-closed|没有可用的审批应答者/.test(esc.lines.join())) {
+  ok("应答者不可用 -> fail-closed(拒绝,不是放行)");
+} else {
+  bad(`unavailable 应该 fail-closed: ${JSON.stringify(esc).slice(0, 160)}`);
+}
+
+// (5) 不认识的结果 -> 也按拒绝(绝不默认放行)
+approvalOutcome = "maybe";
+esc = await call("node_plan", {
+  id: "p-esc5", expect: "怪结果", base: rootBase, verify: "true",
+});
+if (esc.ok === false) ok("审批返回不认识的结果 -> 按拒绝处理(不猜)");
+else bad(`怪结果不该放行: ${JSON.stringify(esc).slice(0, 160)}`);
+
+// (6) **否定验收**:子节点操作不该弹窗 —— 人是只管根的。
+approvalsAsked = 0;
+approvalOutcome = "allowed-once";
+const childOp = await call("node_plan", {
+  id: "p-child", expect: "子节点", base: rootBase, parent: "root",
+  verify: "true", token: ROOT_TOKEN,
+});
+if (childOp.ok === true && approvalsAsked === 0) {
+  ok("建子节点(有父凭证)-> **零弹窗** —— 不打扰人");
+} else {
+  bad(`子节点操作不该弹窗: asked=${approvalsAsked} ${JSON.stringify(childOp).slice(0, 160)}`);
+}
+
+// (7) 改普通子节点、又没凭证 -> 报"找父要",也**不弹窗**
+approvalsAsked = 0;
+const childNoTok = await call("node_plan", {
+  id: "p-child", expect: "改子节点", base: rootBase, parent: "root", verify: "true",
+});
+if (childNoTok.ok === false && approvalsAsked === 0 && /需要它父节点/.test(childNoTok.lines.join())) {
+  ok("改普通子节点没凭证 -> 说清**找父要**,零弹窗(子 agent 不向人提权)");
+} else {
+  bad(`改子节点不该弹窗: asked=${approvalsAsked} ${JSON.stringify(childNoTok).slice(0, 160)}`);
+}
+
+// 拆掉审批服务,回到"没有通道"的默认状态给后面的测试用
+delete services.approval;
 
 // 没有凭证 -> 建不了子节点
 const noTok = await call("node_plan", {

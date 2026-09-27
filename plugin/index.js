@@ -34,6 +34,8 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 import { plan, commit, abandon, normalize } from "../lib/nodes.mjs";
 import { parseDelta } from "../lib/delta.mjs";
 import { renderStatus } from "../lib/view.mjs";
+import { getNode } from "../lib/store.mjs";
+import { requiredAuthority } from "../lib/cap.mjs";
 
 /** 插件的 Cordis 名称。 */
 export const name = "butler-git-tools";
@@ -44,7 +46,7 @@ export const name = "butler-git-tools";
  * Cordis 的 ctx 是 Proxy:没在 inject 里声明的服务属性,读取时**直接抛**
  * `cannot get property "X" without inject`。漏一个,整棵插件树起不来。
  */
-export const inject = ["tools"];
+export const inject = ["tools", "approval"];
 
 /**
  * 会话的工作区 —— 所有状态都在它的 `.bg/` 下。
@@ -101,13 +103,150 @@ const TOKEN_PARAM = {
 };
 
 /**
- * 这次调用是谁。**插件里永远不是 "user"** ——
- * 模型不能自己授权自己,那是人的权限(CLI 的 --as-user)。
+ * 这次调用是谁。**插件里永远不"直接"是 "user"** ——
+ * 模型不能自己授权自己,那是人的权限。
+ *
+ * 但人可以**当场把它借给这一次调用**(见下面 `requestUserActor`):
+ * 弹窗点"允许" -> 这次调用按 `{ kind:"user" }` 走。一次性,不落库。
  */
 function actorOf(args) {
   const t = args?.token;
   if (typeof t === "string" && t) return { kind: "holder", token: t };
   return null;
+}
+
+/**
+ * **向人要授权** —— 根节点那条特殊路径的入口。
+ *
+ * ## 为什么需要它
+ *
+ * `requiredAuthority` 里:根节点没有父,拿不到父的凭证,所以
+ *
+ *     改根 -> 需要 { kind:"user" }
+ *
+ * 而 `{ kind:"user" }` 原来**只在 CLI 存在**(`--as-user`)。
+ * 于是模型想改根只有一条死路:请人开终端。这不该是唯一入口。
+ *
+ * 这里接上 DSH 自己的审批 seam(`ctx.approval`),让模型在会话里
+ * **当场向人申请**,人在界面上点一下即可。
+ *
+ * ## 一次性,而且放行 ≠ 通过
+ *
+ * `allowed-once` 只对**这一次工具调用**有效 —— 不写库、不签发凭证、
+ * 不改变以后任何一次调用。而且它只解决"你有没有权":
+ * 之后的 Δ 比对、P、根 P 照样要跑,过了才是绿。
+ * **权限和门禁是两道独立的门。**
+ *
+ * ## fail-closed
+ *
+ * 没有应答者(无 UI / CI / `policy: never`)-> `unavailable` -> **拒绝**。
+ * 缺了审批通道就是不给,绝不默认放行。
+ */
+async function requestUserActor({ ctx, exec, toolName, what, detail }) {
+  // 取审批服务。**两种写法都要认**:
+  //   ctx.approval   —— Cordis 的常规属性访问(inject 声明过就能读)
+  //   ctx.get(...)   —— 部分宿主/测试用的取法
+  // 而且**别假设它们一定在**:万一宿主没 compose 审批服务,或者 ctx
+  // 形状变了,要走到下面的 fail-closed,而不是在这里崩 ——
+  // 崩掉会让人以为"工具坏了",而真实情况是"没有授权通道,所以不给"。
+  let approval = null;
+  try {
+    approval = ctx?.approval ?? null;
+    if (!approval && typeof ctx?.get === "function") approval = ctx.get("approval") ?? null;
+  } catch {
+    approval = null;   // 严格 ctx 抛(没 inject)-> 当作没有通道
+  }
+  if (!approval || typeof approval.request !== "function") {
+    return {
+      ok: false,
+      problems: [
+        `${what} 需要**人**的授权,但这次调用没有可用的审批通道`
+        + "(没有 ctx.approval)。",
+        "  要么在带界面的会话里重试(会弹窗问人),"
+        + "要么请人用 CLI 跑:`bg ... --as-user`(那条路一直有效)。",
+      ],
+    };
+  }
+
+  const reason = [
+    `butler-git:${what}`,
+    detail,
+    "这是**根节点/人定的节点** —— 它的凭证只能由人签发,agent 拿不到。",
+    "允许 = 仅这一次放行(仍要过 Δ + P + 根 P);不会签发任何凭证。",
+  ].filter(Boolean).join("\n");
+
+  let outcome;
+  try {
+    outcome = await approval.request({
+      agent: exec?.agent,
+      toolName,
+      callId: exec?.callId,
+      reason,
+      ...(exec?.signal ? { signal: exec.signal } : {}),
+    });
+  } catch (e) {
+    // 空闲或在轮次之间调用会在这里抛(见官方实现)—— 如实报出来,不假装问过了。
+    return {
+      ok: false,
+      problems: [
+        `没能向人发起授权请求:${e?.message ?? e}`,
+        "  (这个 seam 要求处于未结束的轮次里;空闲时它拒绝发起)",
+        "  兜底:请人用 CLI 跑 `bg ... --as-user`。",
+      ],
+    };
+  }
+
+  switch (outcome) {
+    case "allowed-once":
+      return { ok: true, actor: { kind: "user" }, via: "approval" };
+    case "rejected":
+      return { ok: false, problems: ["**人拒绝了**这次授权 —— 操作没有执行。"] };
+    case "cancelled":
+      return { ok: false, problems: ["授权请求被**取消**了 —— 操作没有执行。"] };
+    case "unavailable":
+      return {
+        ok: false,
+        problems: [
+          "**没有可用的审批应答者**(fail-closed)—— 操作没有执行。",
+          "  兜底:请人用 CLI 跑 `bg ... --as-user`。",
+        ],
+      };
+    default:
+      // 不合词汇的返回值一律当"没批" —— 绝不默认放行。
+      return { ok: false, problems: [`审批返回了无法识别的结果(${outcome})—— 按拒绝处理。`] };
+  }
+}
+
+/**
+ * 决定这次调用用哪个 actor,必要时**先向人要授权**。
+ *
+ * 只在"真的需要 user、而手上又没有凭证"时才弹窗 ——
+ * 拿得出凭证的调用**一次都不会打扰人**。
+ */
+async function resolveActor({ ctx, exec, toolName, node, args, what, detail }) {
+  const direct = actorOf(args);
+  if (direct) return { ok: true, actor: direct };
+
+  // 这次操作到底要不要人?
+  const need = requiredAuthority(node);
+  if (need !== "user") return { ok: true, actor: null };   // 交给 lib 去报"缺谁的凭证"
+
+  return requestUserActor({ ctx, exec, toolName, what, detail });
+}
+
+/**
+ * 把一次调用的关键信息压成一行,给人看。
+ * 弹窗的 reason 是纯文本,所以这里只放**判断所需的**东西。
+ */
+function describe(node) {
+  const parts = [`节点 ${node.id}`];
+  if (node.expect) parts.push(`目标「${String(node.expect).slice(0, 60)}」`);
+  if (node.verify) parts.push(`P: ${node.verify}`);
+  const d = node.delta?.length
+    ? node.delta.map((x) => `${x.code}:${x.path}`).join(" ")
+    : "(空)";
+  parts.push(`Δ: ${d}`);
+  return parts.join(" · ");
 }
 
 const OUTPUT = {
@@ -213,6 +352,32 @@ export function apply(ctx) {
       output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
       async execute(args, exec) {
         const dir = projectOf(exec, args);
+
+        // **新建根**和**改写已存在的节点**都可能需要人 ——
+        //   新建根:没有父 -> 没有父的凭证可给 -> 要人
+        //   改写:如果目标是根 / owner=user -> 要人
+        // 别的情况(在某个节点下建子节点)走 parent 的凭证,一次都不打扰人。
+        let actor = actorOf(args);
+        if (!actor) {
+          const existing = getNode(dir, args.id);
+          // 目标不存在 + 没有 parent = 在新建一个根
+          const creatingRoot = !existing && !args.parent;
+          const target = existing ?? (creatingRoot ? { id: args.id, parent: null, owner: args.owner ?? "model", expect: args.expect, verify: args.verify, delta: parseDelta(args.delta ?? []) } : null);
+
+          if (target && requiredAuthority(target) === "user") {
+            const resolved = await requestUserActor({
+              ctx, exec, toolName: "node_plan",
+              what: creatingRoot ? `**创建根节点** ${args.id}` : `改写节点 ${existing.id}`,
+              detail: describe(target),
+            });
+            if (!resolved.ok) {
+              return { ok: false, summary: "需要人的授权,但没有拿到", lines: brief(resolved.problems) };
+            }
+            actor = resolved.actor;
+          }
+          // 其他情况 actor 仍是 null —— 由 lib 去报"需要谁的凭证"。
+        }
+
         const r = plan(dir, normalize({
           id: args.id,
           expect: args.expect,
@@ -222,7 +387,7 @@ export function apply(ctx) {
           delta: parseDelta(args.delta ?? []),
           delta_source: args.delta_source ?? null,
           verify: args.verify ?? null,
-        }), { actor: actorOf(args) });
+        }), { actor });
 
         if (!r.ok) {
           return { ok: false, summary: "plan 不通过", lines: brief(r.problems) };
@@ -316,9 +481,28 @@ export function apply(ctx) {
       output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
       async execute(args, exec) {
         const dir = projectOf(exec, args);
+        const node = getNode(dir, args.id);
+        if (!node) {
+          return { ok: false, summary: `${args.id} 不存在`, lines: [] };
+        }
+
+        // 提交是"达成也是一种修改" -> 同样要权限。目标是根时向人要。
+        let actor = actorOf(args);
+        if (!actor && requiredAuthority(node) === "user") {
+          const resolved = await resolveActor({
+            ctx, exec, toolName: "node_commit", node, args,
+            what: `提交(达成)节点 ${node.id}`,
+            detail: describe(node),
+          });
+          if (!resolved.ok) {
+            return { ok: false, summary: `${args.id} **没有提交** —— 没拿到人的授权`, lines: brief(resolved.problems) };
+          }
+          actor = resolved.actor;
+        }
+
         const r = commit(dir, args.id, {
           timeout: Number(args.timeout ?? 120_000),
-          actor: actorOf(args),
+          actor,
         });
 
         if (!r.ok) {
@@ -366,7 +550,26 @@ export function apply(ctx) {
       output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
       async execute(args, exec) {
         const dir = projectOf(exec, args);
-        const r = abandon(dir, args.id, args.reason ?? "", { actor: actorOf(args) });
+        const node = getNode(dir, args.id);
+        if (!node) {
+          return { ok: false, summary: `${args.id} 不存在`, lines: [] };
+        }
+
+        // 放弃也是一种修改(它改图)—— 目标是根时同样向人要。
+        let actor = actorOf(args);
+        if (!actor && requiredAuthority(node) === "user") {
+          const resolved = await resolveActor({
+            ctx, exec, toolName: "node_abandon", node, args,
+            what: `放弃节点 ${node.id}`,
+            detail: describe(node),
+          });
+          if (!resolved.ok) {
+            return { ok: false, summary: `${args.id} 没有放弃 —— 没拿到人的授权`, lines: brief(resolved.problems) };
+          }
+          actor = resolved.actor;
+        }
+
+        const r = abandon(dir, args.id, args.reason ?? "", { actor });
         if (!r.ok) return { ok: false, summary: "abandon 不通过", lines: brief(r.problems) };
         return {
           ok: true,
