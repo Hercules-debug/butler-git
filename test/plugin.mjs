@@ -73,9 +73,19 @@ if (!undeclared.length) {
   bad(`inject 缺声明: ${undeclared.join(", ")} —— 真实启动会抛 "without inject"`);
 }
 
-// **四个。** 上一版六个是负担 —— 模型会挑一个差不多的用,或者开始乱试。
+// **五个。**
+//
+// 上一版六个是负担(模型会挑一个差不多的用,或者开始乱试),收到四个。
+// 又从四个加到五个是因为**多了一条真实的工作流**,不是又多了一个近义词:
+//
+//     子 agent 干完 -> node_commit(门禁过 -> 请示父)
+//     父 agent 看    -> node_approve(重跑门禁 -> 落地)
+//
+// 达成这件事被拆成"提议"和"批准"两步,而这两步是**不同的人**做的
+// (子 / 父),所以它们必须是两个工具。没有别的工具能顶替 node_approve:
+// node_commit 对子 agent 来说只能提议,它落不了地。
 const names = registered.map((t) => t.name).sort();
-const want = ["node_abandon", "node_commit", "node_plan", "node_status"];
+const want = ["node_abandon", "node_approve", "node_commit", "node_plan", "node_status"];
 if (JSON.stringify(names) === JSON.stringify(want)) {
   ok(`注册了 ${names.length} 个工具: ${names.join(", ")}`);
 } else {

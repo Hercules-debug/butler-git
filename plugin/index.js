@@ -31,7 +31,7 @@
 
 import { defineTool } from "@deepseek-ai/dsh-tools";
 
-import { plan, commit, abandon, normalize } from "../lib/nodes.mjs";
+import { plan, commit, abandon, normalize, propose, approve } from "../lib/nodes.mjs";
 import { parseDelta } from "../lib/delta.mjs";
 import { renderStatus } from "../lib/view.mjs";
 import { getNode } from "../lib/store.mjs";
@@ -46,7 +46,7 @@ export const name = "butler-git-tools";
  * Cordis 的 ctx 是 Proxy:没在 inject 里声明的服务属性,读取时**直接抛**
  * `cannot get property "X" without inject`。漏一个,整棵插件树起不来。
  */
-export const inject = ["tools", "approval"];
+export const inject = ["tools", "approval", "agents", "subagents"];
 
 /**
  * 会话的工作区 —— 所有状态都在它的 `.bg/` 下。
@@ -214,6 +214,93 @@ async function requestUserActor({ ctx, exec, toolName, what, detail }) {
     default:
       // 不合词汇的返回值一律当"没批" —— 绝不默认放行。
       return { ok: false, problems: [`审批返回了无法识别的结果(${outcome})—— 按拒绝处理。`] };
+  }
+}
+
+/**
+ * **子 agent 向父 agent 请示** —— 达成要父批准。
+ *
+ * ## 为什么不用 ctx.approval(那是给人用的)
+ *
+ * `ctx.approval` 打通的是"向**人**要授权"(弹窗)。但子节点提交要的是
+ * **父 agent** 的同意 —— 而父不是人,它是这个进程里另一个活的 agent。
+ * 所以走的是另一条路:agent 之间发消息。
+ *
+ * ## 怎么找到父
+ *
+ *     session.header.parentSession    -> SessionId   (持久谱系)
+ *     ctx.agents.get(那个 id)          -> Agent       (活的引用)
+ *
+ * 然后用 `isOwnedBy` 核验一次 —— 它是**运行时**的父子关系,宿主验证过,
+ * 和"子 agent 自己报上来的身份"是两回事(那个不可信,所以凭证系统当初
+ * 才退到"谁拿出钥匙谁有权")。
+ *
+ * ## 为什么是异步的
+ *
+ * `sendMessage` 只保证"送到了",**拿不到回复**。所以子 agent 不能等父
+ * 批准 —— 它报完就结束,父之后异步处理。这正是"子调用 + 异步"那个选择
+ * 的直接体现。
+ *
+ * 返回 `{ok:true, sent:true}` / `{ok:false, problems}`。
+ */
+async function askParent({ ctx, exec, summary }) {
+  const mySession = exec?.agent?.session;
+  const parentId = mySession?.header?.parentSession;
+
+  if (!parentId) {
+    return {
+      ok: false,
+      problems: [
+        "这一步需要**父节点**批准,但这次调用没有父 agent"
+        + "(这是顶层会话,没有可请示的对象)。",
+        "  顶层会话要达成节点,走**人**的授权(会自动弹窗)。",
+      ],
+    };
+  }
+
+  let parentAgent = null;
+  try {
+    parentAgent = ctx.agents.get(parentId) ?? null;
+  } catch (e) {
+    return { ok: false, problems: [`查父 agent 失败:${e?.message ?? e}`] };
+  }
+  if (!parentAgent) {
+    return {
+      ok: false,
+      problems: [
+        `父会话 ${String(parentId).slice(0, 12)} 不在存活列表里 —— 可能已经结束。`,
+        "  它不在了,就没人能批准;要么等它回来,要么由人处理。",
+      ],
+    };
+  }
+
+  // 运行时核验:**我确实挂在这个父下面**(不是随便报一个 id)。
+  try {
+    if (typeof ctx.agents.isOwnedBy === "function"
+        && !ctx.agents.isOwnedBy(mySession.id, parentAgent)) {
+      return {
+        ok: false,
+        problems: ["请求的父 agent 不是**我实际的**创建者 —— 拒绝请示(邻接不符)。"],
+      };
+    }
+  } catch {
+    // 核验接口不可用就不当成失败;下面的 sendMessage 自己还会校验邻接。
+  }
+
+  try {
+    const { brandString } = await import("@deepseek-ai/dsh-tools");
+    const idToSend = typeof brandString === "function" ? brandString(parentId) : parentId;
+    await ctx.subagents.sendMessage(exec.agent, idToSend, [{ type: "text", text: summary }], {});
+    return { ok: true, sent: true };
+  } catch (e) {
+    // sendMessage 会校验邻接关系 —— 非直接父会被它拒。
+    return {
+      ok: false,
+      problems: [
+        `通知父 agent 失败:${e?.message ?? e}`,
+        "  (sendMessage 只允许发给**直接**父或直接子;邻接不符会被拒)",
+      ],
+    };
   }
 }
 
@@ -495,10 +582,51 @@ export function apply(ctx) {
         if (!node) {
           return { ok: false, summary: `${args.id} 不存在`, lines: [] };
         }
+        const timeout = Number(args.timeout ?? 120_000);
 
-        // 提交是"达成也是一种修改" -> 同样要权限。目标是根时向人要。
-        let actor = actorOf(args);
-        if (!actor && requiredAuthority(node) === "user") {
+        // ---------- 有凭证:直接提交(父 agent / 有权者) ----------
+        const direct = actorOf(args);
+        if (direct) {
+          const r = commit(dir, args.id, { timeout, actor: direct });
+          if (!r.ok) {
+            return {
+              ok: false,
+              summary: `${args.id} **没有提交** —— 门禁没过`,
+              lines: brief(r.problems),
+            };
+          }
+          return {
+            ok: true,
+            summary: `● ${args.id} 达成 —— 证据 ${String(r.result).slice(0, 8)}`,
+            lines: [
+              `  验过的树 ${String(r.tree).slice(0, 8)}(和 commit 的内容一个字节都不差)`,
+              ...(r.weak_verify === true
+                ? ["  ⚠ 这条 P 在基线时就通过 —— 它区分不了你做没做"] : []),
+              ...(r.notes ?? []),
+            ],
+          };
+        }
+
+        // ---------- 没凭证:**先跑门禁**,再决定找谁 ----------
+        //
+        // 顺序是刻意的:**先验,再打扰**。
+        // 一个连 Δ 都没过的提交不该去问任何人 —— 那只会浪费对方的注意力,
+        // 而且对方拿到的信息也不足以判断(它看到的是"没过"的东西)。
+        //
+        // 门禁过了之后再分岔:
+        //   · 目标需要**人**(根/owner=user) -> 弹窗(已有)
+        //   · 有父 agent                     -> 请示父(异步)
+        const g = propose(dir, args.id, { timeout });
+        if (!g.ok) {
+          return {
+            ok: false,
+            summary: `${args.id} **没有提交** —— 门禁没过`,
+            lines: brief(g.problems),
+          };
+        }
+
+        const need = requiredAuthority(node);
+        if (need === "user") {
           const resolved = await resolveActor({
             ctx, exec, toolName: "node_commit", node, args,
             what: `提交(达成)节点 ${node.id}`,
@@ -507,29 +635,93 @@ export function apply(ctx) {
           if (!resolved.ok) {
             return { ok: false, summary: `${args.id} **没有提交** —— 没拿到人的授权`, lines: brief(resolved.problems) };
           }
-          actor = resolved.actor;
+          const r = commit(dir, args.id, { timeout, actor: resolved.actor });
+          if (!r.ok) {
+            return { ok: false, summary: `${args.id} **没有提交** —— 门禁没过`, lines: brief(r.problems) };
+          }
+          return {
+            ok: true,
+            summary: `● ${args.id} 达成 —— 证据 ${String(r.result).slice(0, 8)}`,
+            lines: [
+              `  验过的树 ${String(r.tree).slice(0, 8)}(和 commit 的内容一个字节都不差)`,
+              "  (经由**人**的授权 —— allowed-once,仅这一次)",
+            ],
+          };
         }
 
-        const r = commit(dir, args.id, {
-          timeout: Number(args.timeout ?? 120_000),
-          actor,
+        // 请示父 agent。**不落地** —— 达成是父的事(验收权不下放)。
+        const asked = await askParent({
+          ctx,
+          exec,
+          summary: `${g.summary}\n\n请批准:调 node_approve(${args.id}) 落地。\n`
+            + "(我会在批准时**重跑一遍门禁** —— 不采信报上来的结果。)",
         });
+        if (!asked.ok) {
+          return {
+            ok: false,
+            summary: `${args.id} 门禁已过,但**没能请示父节点**`,
+            lines: brief(asked.problems),
+          };
+        }
+        return {
+          ok: true,
+          summary: `${args.id} 门禁已过 —— 已请示父节点批准(**尚未落地**)`,
+          lines: [
+            `  验过的树 ${String(g.treeY).slice(0, 8)}`,
+            "  达成要父节点调 node_approve —— 它会在批准时重跑门禁。",
+            ...(g.weak === true ? ["  ⚠ 这条 P 在基线时就通过 —— 它区分不了你做没做"] : []),
+          ],
+        };
+      },
+    }),
+  );
 
+  // ---------------------------------------------------------- 4. approve
+  ctx.tools.register(
+    defineTool({
+      name: "node_approve",
+      description:
+        "**批准一个子节点达成** —— 父 agent 的动作。\n"
+        + "\n"
+        + "流程:子 agent 干完活调 node_commit,门禁过了会**请示你**;\n"
+        + "你看了它报上来的(节点、Δ、P、验过的树)觉得可以,就调它落地。\n"
+        + "\n"
+        + "**它会重跑一遍门禁** —— 不采信子报上来的结果。原因两条:\n"
+        + "  ① 没有持久化的待批准记录,没有可信的中间结果可查\n"
+        + "  ② 子报上来的东西没有理由被当成事实(它可能报个假的)\n"
+        + "所以 P 会跑两遍(子一次、你一次)。串行场景下工作区没变,\n"
+        + "结果必然一致;**要是变了,那正是该拒绝的时候** ——\n"
+        + "说明你批准的那个世界已经不一样了。\n"
+        + "\n"
+        + "权限:需要**该节点父节点**的凭证(和 commit 同一道门)。\n"
+        + "父 agent 天然持有它;拿不出就批不了。",
+      parameters: {
+        id: { type: "string", required: true, description: "要批准达成的节点 id" },
+        timeout: { type: "number", description: "P 的超时(毫秒),默认 120000" },
+        token: TOKEN_PARAM,
+        ...PROJECT_PARAM,
+      },
+      output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
+      async execute(args, exec) {
+        const dir = projectOf(exec, args);
+        const r = approve(dir, args.id, {
+          timeout: Number(args.timeout ?? 120_000),
+          actor: actorOf(args),
+        });
         if (!r.ok) {
           return {
             ok: false,
-            summary: `${args.id} **没有提交** —— 门禁没过`,
+            summary: `没有批准 ${args.id} —— 门禁没过或权限不够`,
             lines: brief(r.problems),
           };
         }
         return {
           ok: true,
-          summary: `● ${args.id} 达成 —— 证据 ${String(r.result).slice(0, 8)}`,
+          summary: `● 批准了 ${args.id} —— 证据 ${String(r.result).slice(0, 8)}`,
           lines: [
-            `  验过的树 ${String(r.tree).slice(0, 8)}(和 commit 的内容一个字节都不差)`,
+            `  验过的树 ${String(r.tree).slice(0, 8)}(你批准时的重跑结果)`,
             ...(r.weak_verify === true
               ? ["  ⚠ 这条 P 在基线时就通过 —— 它区分不了你做没做"] : []),
-            ...(r.notes ?? []),
           ],
         };
       },

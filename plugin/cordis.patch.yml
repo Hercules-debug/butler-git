@@ -6,7 +6,7 @@
 #  - `insert:` 用于**新增**条目;不带 insert 的顶层条目是**修改已存在**的条目
 #  - `name` 必须是 Node 可解析的包名,与 package.json 的 name 一致
 #
-# 本插件**只注册四个**模型工具(node_plan / node_status / node_commit / node_abandon),
+# 本插件**只注册五个**模型工具(node_plan / node_status / node_commit / node_approve / node_abandon),
 # 人的那一半(node_tree / node_recheck / node_health / node_log)走 CLI,不占模型的工具位。
 #
 # 不改动 DSH 既有条目。
