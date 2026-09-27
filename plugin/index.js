@@ -324,6 +324,15 @@ export function apply(ctx) {
             "**检测程序 P**:一条命令,退出码 0 才算过。必须有 —— "
             + "Δ 只管\"改的是不是这些文件\",没有 P 就没有任何东西说\"改对了\"。",
         },
+        verify_path: {
+          type: "string",
+          description:
+            "**P 的程序文件在哪**(可选)。P 是一条命令,不是路径 —— "
+            + "`grep -q ok root.txt` 里哪个算\"验证程序\"判不出来。"
+            + "想让可视化显示得准就在这里写明脚本文件,如 \"test/plugin.mjs\"。\n"
+            + "不给时工具会**保守推断**(只认 `node <文件>` / `bash <文件>` / `./<文件>` "
+            + "这类明确形态),推不出来就如实说\"没有程序文件\",**不猜**。",
+        },
         parent: {
           type: "string",
           description: "父节点 id。不给 = 这是**根**节点(它的 P 会变成所有人的根门禁)",
@@ -387,6 +396,7 @@ export function apply(ctx) {
           delta: parseDelta(args.delta ?? []),
           delta_source: args.delta_source ?? null,
           verify: args.verify ?? null,
+          verify_path: args.verify_path ?? null,
         }), { actor });
 
         if (!r.ok) {

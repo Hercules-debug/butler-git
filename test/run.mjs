@@ -635,6 +635,65 @@ head("18. 冻结优先于凭证");
   else bad(`父应该能放弃子节点,实际:${abOK.out}`);
 }
 
+// ============================================================ 19. P 的程序文件路径
+//
+// 立场:**宁可说"不知道",也不猜一个看起来像的路径。**
+// 猜错的代价是让人去找一个不存在的文件,比不显示更糟。
+head("19. P 的程序文件路径(保守推断)");
+
+{
+  const { inferVerifyPath } = await import(join(HERE, "..", "lib", "nodes.mjs"));
+
+  // 形态明确的 -> 推得出来
+  for (const [cmd, want] of [
+    ["node test/plugin.mjs", "test/plugin.mjs"],
+    ["python3 -q foo/bar.py", "foo/bar.py"],
+    ["./scripts/ci.sh", "./scripts/ci.sh"],
+    ["/usr/local/bin/node build/v.mjs", "build/v.mjs"],
+    ["bash --noprofile x.sh", "x.sh"],
+  ]) {
+    const got = inferVerifyPath(cmd);
+    if (got === want) ok(`推得出: ${cmd} -> ${want}`);
+    else bad(`该推出来: ${cmd} 期望 ${want},实际 ${got}`);
+  }
+
+  // **形态不明确的 -> 必须返回 null,不许猜。**
+  // `grep -q ok root.txt` 里的 root.txt 是**被验对象**,不是验证程序 ——
+  // 把它当"验证程序路径"是这一节最要防的错。
+  for (const cmd of [
+    "grep -q ok root.txt", "test -f f.txt", "true", "sleep 10", "pytest -q",
+    'node -e "console.log(1)"', 'bash -c "exit 0"',
+  ]) {
+    const got = inferVerifyPath(cmd);
+    if (got === null) ok(`不猜: ${cmd} -> null`);
+    else bad(`不许猜: ${cmd} 应该是 null,实际 ${got}`);
+  }
+
+  // 显式声明优先,而且**不标"推断"**(标注意味着不确定)
+  const d3 = newRepo();
+  const b3 = headSha(d3);
+  bg(d3, ["plan", "--as-user", "--id", "root", "--expect", "根",
+    "--base", b3, "--verify", "test -f f.txt",
+    "--verify-path", "scripts/check.sh"]);
+  const t3 = bg(d3, ["tree"]).out;
+  if (/scripts\/check\.sh/.test(t3) && !/推断/.test(t3)) {
+    ok("显式 verify-path -> 原样显示,且**不**标\"推断\"");
+  } else {
+    bad(`显式路径该被原样显示,实际:${t3.slice(0, 200)}`);
+  }
+
+  // 推不出来的 -> 明说"内联命令",不留白。
+  // 要用一个**真正没有** verify-path 的仓库 —— 上面那个 root 声明过了,
+  // 拿它测会一直看到显式路径,测不到这条。
+  const d4 = newRepo();
+  const b4 = headSha(d4);
+  bg(d4, ["plan", "--as-user", "--id", "root", "--expect", "根",
+    "--base", b4, "--verify", "grep -q v0 f.txt"]);
+  const t4 = bg(d4, ["tree"]).out;
+  if (/内联命令/.test(t4)) ok("推不出来 -> 明说\"P 是内联命令\",不留白");
+  else bad(`推不出来该明说,实际:${t4.slice(0, 200)}`);
+}
+
 // ============================================================ 结果
 
 cleanup();

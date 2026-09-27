@@ -25,7 +25,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 
 import { head, isRepo } from "../lib/git.mjs";
-import { plan, commit, abandon, normalize } from "../lib/nodes.mjs";
+import { plan, commit, abandon, normalize, verifyPathOf } from "../lib/nodes.mjs";
 import { parseDelta } from "../lib/delta.mjs";
 import {
   renderTree, renderStatus, renderLog, healthLine,
@@ -286,6 +286,7 @@ function main() {
       delta: parseDelta(asList(flags.delta)),
       delta_source: flags["delta-source"] ?? null,
       verify: flags.verify ?? null,
+      verify_path: flags["verify-path"] ?? null,
     };
     const r = plan(dir, normalize(raw), { actor: actorOf(flags) });
     if (!r.ok) {
@@ -300,6 +301,12 @@ function main() {
       `  Δ       ${n.delta.length ? n.delta.map((d) => `${d.code} ${d.path}`).join("  ") : "(空 —— 没有任何东西防止意外改动)"}`,
       `  P       ${n.verify}`,
     ];
+    // P 的程序文件在哪 —— 显式给了就说"声明",推断出来的说"推断",
+    // 都没有就**直说没有**(不留给可视化去猜)。见 nodes.mjs 的 inferVerifyPath。
+    const vpath = verifyPathOf(n);
+    if (n.verify_path) lines.push(`  P 文件  ${n.verify_path}   (显式声明)`);
+    else if (vpath) lines.push(`  P 文件  ${vpath}   (从命令推断 —— 想精确请用 --verify-path)`);
+    else lines.push("  P 文件  (没有 —— P 是内联命令,不是脚本文件)");
     // **凭证明文只出现这一次。** 之后工具里查不到它,只有你自己记着。
     if (r.token) {
       lines.push("");
