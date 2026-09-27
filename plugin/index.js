@@ -72,6 +72,44 @@ const PROJECT_PARAM = {
   },
 };
 
+/**
+ * 凭证(capability)—— **像目录权限,而且向下包含**。
+ *
+ *     持有 X 的凭证  ->  能改 X 的**所有后代**
+ *     改 X 自己      ->  需要 parent(X) 的凭证  <- 这就是"向创建者提权"
+ *     根节点         ->  没有父,只能由人签发
+ *
+ * 所以你拿到一个节点的凭证,就在它下面任意控制;但要改那个节点**本身**,
+ * 得找创建它的那个(它的父)拿凭证。
+ *
+ * ## 为什么是凭证,不是 agent id
+ *
+ * 工具拿得到 `exec.agent.id`,但它不该被当成认证依据 ——
+ * 一个 subagent 报上来的身份,工具核验不了。拿它做权限,
+ * 等于把一道门建在自己都验证不了的东西上。
+ *
+ * 凭证绕开这件事:**谁拿出凭证谁有权**,不问你是谁。
+ * 所以库里只存 hash,明文只在创建时给一次。
+ */
+const TOKEN_PARAM = {
+  type: "string",
+  description:
+    "你持有的**凭证**。创建节点时工具会给你一个(只在那一刻显示一次,"
+    + "之后查不到,自己收好)。\n"
+    + "拿着 X 的凭证 -> 能在 X 下面建子节点、改 X 的所有后代。\n"
+    + "要改 X **自己** -> 需要它父节点的凭证(向创建者提权)。",
+};
+
+/**
+ * 这次调用是谁。**插件里永远不是 "user"** ——
+ * 模型不能自己授权自己,那是人的权限(CLI 的 --as-user)。
+ */
+function actorOf(args) {
+  const t = args?.token;
+  if (typeof t === "string" && t) return { kind: "holder", token: t };
+  return null;
+}
+
 const OUTPUT = {
   type: "object",
   additionalProperties: true,
@@ -113,9 +151,14 @@ export function apply(ctx) {
         + "  **精确等于**:少了=漏做,多了=预期外的改动,类型不符=做错方向。\n"
         + "  不给 = 空。**空不是'没改动',是'没预测'** —— 那就没有任何东西防止意外改动。\n"
         + "\n"
-        + "两道门(会在改的时候拦你):\n"
-        + "  1. **达成过的节点,门禁冻结。** 要变,起一个新节点 —— 历史不改写。\n"
-        + "  2. owner=user 且已经有一份门禁 -> 你改不动,要人授权。",
+        + "权限(**像目录权限,而且向下包含**):\n"
+        + "  持有 X 的凭证 -> 能在 X 下面建子节点、改 X 的**所有后代**\n"
+        + "  改 X 自己     -> 需要它**父**的凭证 —— 这就是「向创建者提权」\n"
+        + "  根节点        -> 没有父,只能由人签发(你没有,所以别试图建根)\n"
+        + "  已达成        -> **冻结,任何凭证都改不动。** 要变就起一个新节点。\n"
+        + "\n"
+        + "创建时会返回一个 🔑 凭证 —— **它只显示这一次**,收好。\n"
+        + "不给 token = 没有凭证:只能建人已经给了你父凭证的节点。",
       parameters: {
         id: {
           type: "string",
@@ -164,6 +207,7 @@ export function apply(ctx) {
             "before-work(默认)= 动手前声明的,真的能拦住方向性错误;"
             + "at-commit = 提交时照着 git status 抄的,只能拦住\"忘了说\"。",
         },
+        token: TOKEN_PARAM,
         ...PROJECT_PARAM,
       },
       output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
@@ -178,23 +222,32 @@ export function apply(ctx) {
           delta: parseDelta(args.delta ?? []),
           delta_source: args.delta_source ?? null,
           verify: args.verify ?? null,
-        }), { asUser: false });
+        }), { actor: actorOf(args) });
 
         if (!r.ok) {
           return { ok: false, summary: "plan 不通过", lines: brief(r.problems) };
         }
         const n = r.node;
+        const lines = [
+          `  expect  ${n.expect}`,
+          `  base    ${String(n.base).slice(0, 8)}`,
+          `  Δ       ${n.delta.length
+            ? n.delta.map((d) => `${d.code} ${d.path}`).join("  ")
+            : "(空 —— 没有任何东西防止意外改动)"}`,
+          `  P       ${n.verify}`,
+        ];
+        // **凭证明文只出现这一次。** 之后没有任何办法查回它。
+        if (r.token) {
+          lines.push("");
+          lines.push(`  🔑 凭证  ${r.token}`);
+          lines.push("     **收好它 —— 只显示这一次。**");
+          lines.push(`     拿着它:能在 ${n.id} 下面建子节点、改它的所有后代`);
+          lines.push(`     改 ${n.id} 自己:要它父节点的凭证(向创建者提权)`);
+        }
         return {
           ok: true,
           summary: `${r.rewrite ? "改写" : "声明"}了 ${n.id}`,
-          lines: [
-            `  expect  ${n.expect}`,
-            `  base    ${String(n.base).slice(0, 8)}`,
-            `  Δ       ${n.delta.length
-              ? n.delta.map((d) => `${d.code} ${d.path}`).join("  ")
-              : "(空 —— 没有任何东西防止意外改动)"}`,
-            `  P       ${n.verify}`,
-          ],
+          lines,
         };
       },
     }),
@@ -216,6 +269,7 @@ export function apply(ctx) {
         + "想提交之前先跑它。",
       parameters: {
         id: { type: "string", required: true, description: "节点 id" },
+        token: TOKEN_PARAM,
         ...PROJECT_PARAM,
       },
       output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
@@ -256,12 +310,16 @@ export function apply(ctx) {
           type: "number",
           description: "P 的超时(毫秒),默认 120000",
         },
+        token: TOKEN_PARAM,
         ...PROJECT_PARAM,
       },
       output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
       async execute(args, exec) {
         const dir = projectOf(exec, args);
-        const r = commit(dir, args.id, { timeout: Number(args.timeout ?? 120_000) });
+        const r = commit(dir, args.id, {
+          timeout: Number(args.timeout ?? 120_000),
+          actor: actorOf(args),
+        });
 
         if (!r.ok) {
           return {
@@ -302,12 +360,13 @@ export function apply(ctx) {
       parameters: {
         id: { type: "string", required: true, description: "节点 id" },
         reason: { type: "string", description: "为什么放弃(会记进账本)" },
+        token: TOKEN_PARAM,
         ...PROJECT_PARAM,
       },
       output: { schema: OUTPUT, render: (_a, v) => [{ type: "text", text: renderText(v) }] },
       async execute(args, exec) {
         const dir = projectOf(exec, args);
-        const r = abandon(dir, args.id, args.reason ?? "");
+        const r = abandon(dir, args.id, args.reason ?? "", { actor: actorOf(args) });
         if (!r.ok) return { ok: false, summary: "abandon 不通过", lines: brief(r.problems) };
         return {
           ok: true,

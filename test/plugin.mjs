@@ -151,12 +151,45 @@ if (threwVerify) ok("没给 P -> schema 直接拒(必填)");
 else bad("verify 是必填,schema 应该拒");
 
 // --- 正常声明 ---
-const dec = await call("node_plan", {
-  id: "p-1", expect: "让 x.py 支持 v2", base: BASE,
-  verify: "grep -q v2 x.py", delta: ["M:x.py"],
+// 根节点只能由**人**签发(--as-user),插件里没有这个开关。
+// 所以先让 CLI 建好根、拿回凭证 —— 插件从根往下拆。
+const seed = spawnSync("node", [join(ROOT, "bin", "bg.mjs"), "--dir", d,
+  "plan", "--as-user", "--id", "root", "--expect", "根", "--base", BASE,
+  "--verify", "test -f x.py"], { encoding: "utf8" });
+const ROOT_TOKEN = `${seed.stdout ?? ""}`.match(/凭证\s+(\w+)/)?.[1];
+if (ROOT_TOKEN) ok("根节点由**人**创建,拿到凭证(插件没这个开关)");
+else bad(`人建根应该拿到凭证: ${(seed.stdout ?? "") + (seed.stderr ?? "")}`.slice(0, 200));
+
+// 插件**不能**建根节点
+const noRoot = await call("node_plan", {
+  id: "p-root", expect: "我想建个根", base: BASE, verify: "true",
 });
-if (dec.ok === true) ok("node_plan 写进图");
-else bad(`node_plan 失败: ${JSON.stringify(dec).slice(0, 160)}`);
+if (noRoot.ok === false && /只能由\*\*人\*\*签发/.test(noRoot.lines.join())) {
+  ok("插件建根节点 -> 拒绝(模型不能自己签发)");
+} else {
+  bad(`插件不该能建根: ${JSON.stringify(noRoot).slice(0, 200)}`);
+}
+
+// 没有凭证 -> 建不了子节点
+const noTok = await call("node_plan", {
+  id: "p-0", expect: "没凭证", base: BASE, verify: "true", parent: "root",
+});
+if (noTok.ok === false && /需要 root 自己的凭证/.test(noTok.lines.join())) {
+  ok("没凭证建子节点 -> 拒绝,并说清需要**谁的**");
+} else {
+  bad(`没凭证应该被拒: ${JSON.stringify(noTok).slice(0, 200)}`);
+}
+
+const dec = await call("node_plan", {
+  id: "p-1", expect: "让 x.py 支持 v2", base: BASE, parent: "root",
+  verify: "grep -q v2 x.py", delta: ["M:x.py"], token: ROOT_TOKEN,
+});
+if (dec.ok === true && /凭证/.test(dec.lines.join())) {
+  ok("拿父凭证 -> 建子节点成功,并拿到**自己的**凭证");
+} else {
+  bad(`node_plan 失败: ${JSON.stringify(dec).slice(0, 200)}`);
+}
+const P1 = dec.lines.join().match(/凭证\s+(\w+)/)?.[1];
 
 // --- status:便宜,不跑 P ---
 const st = await call("node_status", { id: "p-1" });
@@ -167,7 +200,7 @@ if (st.ok === true && /漏做/.test(st.lines.join())) {
 }
 
 // --- commit:没做 -> 不提交,给要求 ---
-const early = await call("node_commit", { id: "p-1" });
+const early = await call("node_commit", { id: "p-1", token: ROOT_TOKEN });
 if (early.ok === false && /要求/.test(early.lines.join())) {
   ok("node_commit 没过时**不提交**,并给出要求");
 } else {
@@ -177,7 +210,7 @@ if (early.ok === false && /要求/.test(early.lines.join())) {
 // --- 预期外的改动 ---
 writeFileSync(join(d, "x.py"), "v2\n", "utf8");
 writeFileSync(join(d, "junk.py"), "junk\n", "utf8");
-const junk = await call("node_commit", { id: "p-1" });
+const junk = await call("node_commit", { id: "p-1", token: ROOT_TOKEN });
 if (junk.ok === false && /预期外/.test(junk.lines.join())) {
   ok("node_commit 抓住**预期外的改动**");
 } else {
@@ -186,7 +219,7 @@ if (junk.ok === false && /预期外/.test(junk.lines.join())) {
 
 // --- 真的达成 ---
 rmSync(join(d, "junk.py"));
-const acc = await call("node_commit", { id: "p-1" });
+const acc = await call("node_commit", { id: "p-1", token: ROOT_TOKEN });
 if (acc.ok === true && /达成/.test(acc.summary)) {
   ok("node_commit 全过 -> 达成(产出证据 commit)");
 } else {
@@ -196,6 +229,7 @@ if (acc.ok === true && /达成/.test(acc.summary)) {
 // --- 冻结 ---
 const frozen = await call("node_plan", {
   id: "p-1", expect: "改主意", base: BASE, verify: "true",
+  parent: "root", token: ROOT_TOKEN,
 });
 if (frozen.ok === false && /冻结/.test(frozen.lines.join())) {
   ok("已达成的节点 -> 门禁冻结");
@@ -206,15 +240,28 @@ if (frozen.ok === false && /冻结/.test(frozen.lines.join())) {
 // --- abandon:未达成的能放弃 ---
 const dec2 = await call("node_plan", {
   id: "p-2", expect: "以后做", base: BASE, verify: "true",
+  parent: "root", token: ROOT_TOKEN,
 });
 if (dec2.ok !== true) bad(`p-2 声明失败: ${JSON.stringify(dec2).slice(0, 160)}`);
-const ab = await call("node_abandon", { id: "p-2", reason: "不做" });
+
+// 改 p-2 **自己**要父凭证 —— 拿它自己的凭证不行(向创建者提权)
+const selfTok = await call("node_plan", {
+  id: "p-2", expect: "我自己改自己", base: BASE, verify: "true",
+  parent: "root", token: dec2.lines.join().match(/凭证\s+(\w+)/)?.[1],
+});
+if (selfTok.ok === false && /需要它父节点/.test(selfTok.lines.join())) {
+  ok("改自己要**父**的凭证 —— 向创建者提权");
+} else {
+  bad(`改自己应该要父凭证: ${JSON.stringify(selfTok).slice(0, 200)}`);
+}
+
+const ab = await call("node_abandon", { id: "p-2", reason: "不做", token: ROOT_TOKEN });
 if (ab.ok === true) ok("node_abandon 移除未达成的声明");
 else bad(`abandon 失败: ${JSON.stringify(ab).slice(0, 160)}`);
 
 // --- 已达成的不能放弃 ---
-const abDone = await call("node_abandon", { id: "p-1" });
-if (abDone.ok === false && /不能放弃/.test(abDone.lines.join())) {
+const abDone = await call("node_abandon", { id: "p-1", token: ROOT_TOKEN });
+if (abDone.ok === false && /不能放弃|任何凭证都改不动/.test(abDone.lines.join())) {
   ok("已达成的节点 -> 不能放弃(历史不改写)");
 } else {
   bad(`已达成的节点不该能放弃: ${JSON.stringify(abDone).slice(0, 200)}`);
