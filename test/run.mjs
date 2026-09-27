@@ -810,6 +810,90 @@ head("验收 16:changed(增量谓词) —— 「改动了」和「没改」要�
   }
 }
 
+// ================================================================ 验收 17
+head("验收 17:并行 —— 一个工作区、两个 subagent");
+
+// 这一节是实测踩出来的三件事,每一件都对应一个真问题:
+//
+//   1. 状态文件会被并行写坏(固定临时名 -> ENOENT 崩溃;读-改-写 -> 丢节点)
+//   2. 顺序工作时,前一个节点已验收的改动会被算到后一个节点头上(冤枉)
+//   3. 并行工作时,**归属根本无法确定** —— 这个治不了,只能诚实报"不知道"
+{
+  // --- 17a:并发 declare 不能丢节点 ---
+  const d = newRepo();
+  write(d, "x.py", "v1\n");
+  sh("git add -A && git -c user.email=a@b -c user.name=a commit -q -m base", d);
+  bg(d, ["init"]);
+
+  const runs = [];
+  for (let i = 0; i < 8; i += 1) {
+    for (const who of ["A", "B"]) {
+      runs.push(new Promise((res) => {
+        const p = spawn("node", [BG, "--project", d, "declare",
+          "--id", `${who}${i}`, "--expect", `${who} 的节点`, "--fs-changed", "x.py"],
+        { stdio: "ignore" });
+        p.on("close", (code) => res(code));
+      }));
+    }
+  }
+  const codes = await Promise.all(runs);
+  const nodes = JSON.parse(readFileSync(join(d, ".bg", "nodes.json"), "utf8")).nodes;
+  const led = readFileSync(join(d, ".bg", "ledger.jsonl"), "utf8")
+    .split("\n").filter((l) => l.includes('"type":"node"')).length;
+
+  if (codes.every((c) => c === 0) && Object.keys(nodes).length === 16 && led === 16) {
+    ok(`16 个并发 declare:全成功、节点 16 个、账本 16 条(没有丢,也没有崩)`);
+  } else {
+    bad(`并发丢了东西: 退出码=${codes.filter((c) => c !== 0).length} 个非 0,`
+      + ` 节点 ${Object.keys(nodes).length}/16, 账本 ${led}/16`);
+  }
+
+  // --- 17b:顺序工作时,前一个节点已验收的改动不该算到后一个头上 ---
+  const d2 = newRepo();
+  write(d2, "src/a.py", "a-v1\n");
+  write(d2, "src/b.py", "b-v1\n");
+  sh("git add -A && git -c user.email=a@b -c user.name=a commit -q -m base", d2);
+  bg(d2, ["init"]);
+  bg(d2, ["declare", "--id", "n1", "--expect", "改 a", "--allow", "src/a.py",
+    "--fs-changed", "src/a.py"]);
+  write(d2, "src/a.py", "a-v2\n");
+  bg(d2, ["accept", "n1"]);
+
+  bg(d2, ["declare", "--id", "n2", "--expect", "改 b", "--allow", "src/b.py",
+    "--fs-changed", "src/b.py"]);
+  write(d2, "src/b.py", "b-v2\n");
+  const r2 = bg(d2, ["assert", "n2"]);
+  if (r2.code === 0) {
+    ok("顺序工作:n1 已验收的改动**没有**被算成 n2 的越界(节点级基线)");
+  } else {
+    bad(`n2 被 n1 的改动冤枉了: ${r2.out.trim().slice(0, 160)}`);
+  }
+
+  // --- 17c:并行工作时,归属不确定 -> 不许假装知道 ---
+  const d3 = newRepo();
+  write(d3, "src/a.py", "a-v1\n");
+  write(d3, "src/b.py", "b-v1\n");
+  sh("git add -A && git -c user.email=a@b -c user.name=a commit -q -m base", d3);
+  bg(d3, ["init"]);
+  bg(d3, ["declare", "--id", "agentA", "--expect", "改 a", "--allow", "src/a.py",
+    "--fs-changed", "src/a.py"]);
+  bg(d3, ["declare", "--id", "agentB", "--expect", "改 b", "--allow", "src/b.py",
+    "--fs-changed", "src/b.py"]);
+  write(d3, "src/b.py", "b-v2\n");   // B 干了活,A 什么都没做
+
+  const rA = bg(d3, ["assert", "agentA"]);
+  if (/越界\?/.test(rA.out) && /归属无法确定/.test(rA.out)) {
+    ok("并行:A 没被冤枉成「越界」,而是报「归因不确定」");
+  } else {
+    bad(`并行归属没处理好: ${rA.out.trim().slice(0, 160)}`);
+  }
+  if (rA.code !== 0) {
+    ok("而且它**不算通过** —— 世界在被别人改的时候,没法诚实验收");
+  } else {
+    bad("归因不确定却算它通过了");
+  }
+}
+
 // ================================================================ 收尾
 
 for (const d of tmpdirs) rmSync(d, { recursive: true, force: true });
