@@ -21,8 +21,8 @@
  *   bg log             从 commit trailer 读出来的历史
  */
 
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { readFileSync, writeFileSync } from "node:fs";
+import { resolve, join } from "node:path";
 
 import { head, isRepo } from "../lib/git.mjs";
 import { plan, commit, abandon, normalize } from "../lib/nodes.mjs";
@@ -31,6 +31,8 @@ import {
   renderTree, renderStatus, renderLog, healthLine,
 } from "../lib/view.mjs";
 import { recheck, crossCheck } from "../lib/recheck.mjs";
+import { renderHtml } from "../lib/html.mjs";
+import { serve, DEFAULT_PORT } from "../lib/serve.mjs";
 
 const REPEATABLE = new Set(["delta"]);
 
@@ -41,17 +43,45 @@ function parseArgs(argv) {
     const a = argv[i];
     if (!a.startsWith("--")) { positional.push(a); continue; }
     const key = a.slice(2);
+
+    // **可重复的 flag 要一直吃到下一个 `--` 为止。**
+    //
+    // 原来这里只吃**一个**值:
+    //     --delta "M:a.py" "A:b.py" "D:c.py"
+    //   -> 只有 "M:a.py" 进了 delta,后两个掉到第 42 行被当成位置参数,
+    //      **静默丢弃**。人以为声明了三条 Δ,工具只记了一条 ——
+    //      于是"预期外改动"会报出一堆其实声明过的文件。
+    //      最坏的是它**不报错**:丢得无声无息。
+    //
+    // 所以两种写法都得支持:
+    //     --delta a --delta b        (重复 flag)
+    //     --delta a b                (空格分隔)
+    // 两者可以混用,结果都是 [a, b]。
+    if (REPEATABLE.has(key)) {
+      const vals = Array.isArray(flags[key])
+        ? flags[key]
+        : (flags[key] === undefined || flags[key] === true ? [] : [flags[key]]);
+      let j = i + 1;
+      while (j < argv.length && !String(argv[j]).startsWith("--")) {
+        vals.push(argv[j]);
+        j += 1;
+      }
+      if (!vals.length) {
+        flags[key] = true;      // --delta 后面没给值:保持原来的布尔语义
+      } else {
+        flags[key] = vals;
+        i = j - 1;              // 让循环末尾的 i += 1 落在下一个未读参数上
+      }
+      continue;
+    }
+
     const next = argv[i + 1];
     if (next === undefined || next.startsWith("--")) {
       flags[key] = true;
       continue;
     }
     i += 1;
-    if (REPEATABLE.has(key)) {
-      flags[key] = [...(flags[key] ?? []), next];
-    } else {
-      flags[key] = next;
-    }
+    flags[key] = next;
   }
   return { positional, flags };
 }
@@ -102,12 +132,17 @@ bg —— 节点是「意图」,commit 是「证据」
   bg plan     --id <id> --expect <一句话> --base <sha> --verify <命令>
               [--parent <id>] [--owner user|model]
               [--delta "M:src/a.py"]... [--delta-source at-commit]
+                 Δ 可重复也可空格分隔,两种等价(可以混用):
+                   --delta "M:a.py" --delta "A:b.py"
+                   --delta "M:a.py" "A:b.py"
   bg status   <id>                    相对 base 改了什么;和 Δ 比差在哪(不跑 P)
   bg commit   <id> [--timeout <ms>]   提交即门禁:Δ + P + 根 P,过了才产生版本
   bg abandon  <id> [--reason ...]     把一个声明了但没做的任务从图里移除
 
 人用的:
   bg tree                 看整棵树(灯 + P 原文 + 弱 P 标记 + 图外的提交)
+  bg html  [文件]         同上,渲染成一个**单文件 HTML**(默认 .bg/tree.html)
+  bg serve [--port N]     前台实时查看器(默认 127.0.0.1:8731),Ctrl+C 停
   bg recheck  [--full]    对当前 commit 复查各历史节点(诊断,不是灯)
   bg health               心跳一行
   bg log                  从 commit trailer 读出来的历史
@@ -151,6 +186,38 @@ function main() {
 
   if (cmd === "log") {
     emit(renderLog(dir));
+    return;
+  }
+
+  // **HTML:写到文件,不打到 stdout。**
+  // 打到 stdout 的话 `bg html > x.html` 能用,但管道里混着别的输出就废了;
+  // 而且默认给一个确定路径,人不用记重定向。
+  if (cmd === "html") {
+    const dest = positional[1] ?? join(dir, ".bg", "tree.html");
+    writeFileSync(dest, renderHtml(dir), "utf8");
+    out([`写好了 ${dest}`, "  浏览器打开即可。它是**单文件**,不联网、不依赖任何东西。"]);
+    return;
+  }
+
+  // **前台查看器。** 它占着终端 —— 所以你**看得见**它活着;
+  // Ctrl+C 就停,不留后台进程。刻意不做 daemon / pid 那套。
+  if (cmd === "serve") {
+    const port = Number(flags.port ?? DEFAULT_PORT);
+    // 注意:`main()` 不是 async(改它会影响上面所有命令),所以用
+    // Promise 的 then/catch,而不是 await。
+    serve(dir, { port }).then((s) => {
+      out([
+        `看着 ${dir}`,
+        `  ${s.url}`,
+        "",
+        "  浏览器打开上面那个地址。**页面每 2 秒自己更新一次**,不用按 F5。",
+        "  停:Ctrl+C(它只活在这个终端里,关掉就没了)。",
+      ]);
+      // 让 SIGINT 干净退出,不打难看的堆栈。
+      process.on("SIGINT", () => { out(["", "停了。"]); process.exit(0); });
+    }).catch((e) => {
+      die(`bg serve 起不来:\n  ${String(e?.message ?? e).split("\n").join("\n  ")}`);
+    });
     return;
   }
 
