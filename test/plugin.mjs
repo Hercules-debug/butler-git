@@ -309,7 +309,14 @@ console.log("\n1c. 子请示父 / 顶层降级问人");
     isOwnedBy: () => true,
   };
   let sentCount = 0;
-  services.subagents = { sendMessage: async () => { sentCount += 1; return "m1"; } };
+  let lastMsg = null;
+  services.subagents = {
+    sendMessage: async (_s, _t, content) => {
+      sentCount += 1;
+      lastMsg = content?.[0]?.text ?? "";
+      return "m1";
+    },
+  };
 
   // (1) 子提交普通节点 -> 请示父,**不落地**
   //
@@ -346,6 +353,47 @@ console.log("\n1c. 子请示父 / 顶层降级问人");
     bad(`顶层应降级问人并落地: asked=${approvalsAsked} state=${gn(d, "k2").state} ${JSON.stringify(toTop).slice(0, 140)}`);
   }
 
+  // (2b) 父批准**候选 commit** —— 子报上来的那个对象
+  //
+  // 这是"子申请 -> 父批准"的正路:父批的是子**当时验过的对象**,
+  // 不是"父现在看到的工作区"。三条校验都要能拦住坏的输入。
+  {
+    const { execSync: ex } = await import("node:child_process");
+    await call("node_plan", {
+      id: "k4", parent: "root", expect: "候补", base: BASE,
+      verify: "test -f x.py", delta: ["A:k1.txt", "A:k2.txt", "A:k4.txt"], token: ROOT_TOKEN,
+    });
+    writeFileSync(join(d, "k4.txt"), "z\n", "utf8");
+    sentCount = 0;
+    const prop = await tool("node_commit").execute({ id: "k4", project: d }, childExec);
+    const csha = (sentCount && prop.ok) ? /candidate: "([0-9a-f]+)"/.exec(lastMsg ?? "")?.[1] : null;
+
+    if (csha) {
+      // 批准一个**假的** sha -> 必须被拒
+      const bad = tool("node_approve").execute(
+        { id: "k4", project: d, token: ROOT_TOKEN, candidate: "deadbeef".repeat(5) }, exec,
+      );
+      const badR = await bad;
+      if (badR.ok === false && /不是一个 commit/.test(badR.lines.join())) {
+        ok("批准假 sha -> 拒绝(它不是 commit 对象)");
+      } else {
+        bad(`假 sha 该被拒: ${JSON.stringify(badR).slice(0, 140)}`);
+      }
+
+      // 批准**真的**候选 -> 落地
+      const good = await tool("node_approve").execute(
+        { id: "k4", project: d, token: ROOT_TOKEN, candidate: csha }, exec,
+      );
+      if (good.ok === true && gn(d, "k4").state === "done") {
+        ok("批准**真候选** -> 落地(不重跑门禁,不碰子的工作区)");
+      } else {
+        bad(`真候选该被批准: ${JSON.stringify(good).slice(0, 140)}`);
+      }
+    } else {
+      bad(`没拿到候选 sha(prop.ok=${prop.ok} sent=${sentCount})`);
+    }
+  }
+
   // (3) 门禁没过时,谁都不打扰 —— "先验,再提权"
   await call("node_plan", {
     id: "k3", parent: "root", expect: "没干活", base: BASE,
@@ -366,11 +414,21 @@ console.log("\n1c. 子请示父 / 顶层降级问人");
   // **把工作区还原** —— 这一段在**共享仓库 d** 上跑,留下的文件会污染
   // 后面的测试(p-1 的门禁会把 k1.txt/k2.txt 报成"预期外",连锁三条失败)。
   // 实测踩过:单独跑这一节全过,整文件跑就 3 条败。
-  sh("git checkout -- .");
-  for (const f of ["k1.txt", "k2.txt"]) {
+  //
+  // 清理由**已知的测试文件名**驱动,而不是"git status 里所有未跟踪文件"
+  // —— 后者会误删别的测试留下的东西。加新节点时记得往这个列表里补。
+  // 回到这一节开始前的那个 commit —— k2/k4 提交过,HEAD 已经前进了。
+  // 只删文件不够:它们在 HEAD 里,`git status` 会一直显示 "D"。
+  sh(`git reset -q --hard ${BASE}`);
+  for (const f of ["k1.txt", "k2.txt", "k4.txt"]) {
     try { rmSync(join(d, f), { force: true }); } catch { /* 已经没了 */ }
   }
-  sh("git reset -q HEAD");   // k2 提交过,k1 没有 —— 索引也要跟上
+  // `.bg/` 是工具自己的状态目录,它本来就该在 —— 不算污染。
+  const stray = sh("git status --porcelain").stdout
+    .split("\n").map((l) => l.trim()).filter(Boolean)
+    .filter((l) => !l.includes(".bg/"));
+  if (stray.length) bad(`1c 段没清理干净,会污染后面的测试:\n  ${stray.join("\n  ")}`);
+  else ok("1c 段跑完把工作区还原干净(不污染后面的测试)");
 }
 
 // 拆掉审批服务,回到"没有通道"的默认状态给后面的测试用

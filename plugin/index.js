@@ -680,8 +680,10 @@ export function apply(ctx) {
         const asked = await askParent({
           ctx,
           exec,
-          summary: `${g.summary}\n\n请批准:调 node_approve(${args.id}) 落地。\n`
-            + "(我会在批准时**重跑一遍门禁** —— 不采信报上来的结果。)",
+          summary: `${g.summary}\n\n`
+            + `请批准:node_approve(${args.id}, candidate: "${g.candidate}")\n`
+            + "候选 commit 已经建好了(**没挂到 HEAD 上**),父批准时才落地。\n"
+            + "父不需要访问我的工作区 —— 需要的一切都在那个 commit 里。",
         });
         if (!asked.ok) {
           return {
@@ -724,6 +726,16 @@ export function apply(ctx) {
         + "父 agent 天然持有它;拿不出就批不了。",
       parameters: {
         id: { type: "string", required: true, description: "要批准达成的节点 id" },
+        candidate: {
+          type: "string",
+          description:
+            "子 agent 报上来的**候选 commit sha**。给了它就批准**那个对象** —— "
+            + "不重跑门禁,而且父不需要访问子的工作区。\n"
+            + "不给则退回旧路:父在自己的工作区里重跑门禁再提交"
+            + "(只在父子看同一个工作区时才等价)。\n"
+            + "无论给不给,都会校验:它是不是 commit、它的父是不是当前 HEAD、"
+            + "它自称验过的树和它实际的内容对不对得上。",
+        },
         timeout: { type: "number", description: "P 的超时(毫秒),默认 120000" },
         token: TOKEN_PARAM,
         ...PROJECT_PARAM,
@@ -734,6 +746,7 @@ export function apply(ctx) {
         const r = approve(dir, args.id, {
           timeout: Number(args.timeout ?? 120_000),
           actor: actorOf(args),
+          candidate: args.candidate ?? null,
         });
         if (!r.ok) {
           return {
