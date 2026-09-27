@@ -284,7 +284,7 @@ B:加了个 report(),依赖 total() 返回数字
                  │  done  │  有一个结果 commit;绿;门禁冻结
                  └────────┘
 
-  任何时刻(未 done):  node_drop     ->  abandoned(从图里移出)
+  任何时刻(未 done):  node_abandon     ->  abandoned(从图里移出)
 ```
 
 **派生出来的显示状态**(不存储,算出来的):
@@ -365,7 +365,7 @@ node_tree 报:
 | `node_plan` | 声明一个任务(base / expect / Δ? / P) | 否 |
 | `node_status` | 相对 base 改了什么;**和 Δ 比差在哪** | **否**(和 `git status` 一样便宜) |
 | `node_commit` | **提交即门禁**:Δ + P + 根 P,过了才产生版本 | 是 |
-| `node_drop` | 把一个**声明了但没做**的任务从图里移除 | 否 |
+| `node_abandon` | 把一个**声明了但没做**的任务从图里移除 | 否 |
 
 ### 为什么不是"看树"和"合并"两个单独的工具
 
@@ -394,7 +394,7 @@ node_tree 报:
 实测:模型自己 `git merge --no-commit` 之后,由普通 `git commit` 产出的提交
 **有两个父**,是一个真正的 merge commit。所以这一步不需要单独的工具。
 
-### 但 `node_drop` 砍不掉
+### 但 `node_abandon` 砍不掉
 
 ```
 node_plan 声明一个意图  ->  它必须被记下来(否则人看不见计划)
@@ -409,7 +409,7 @@ node_plan 声明一个意图  ->  它必须被记下来(否则人看不见计划
 "把工作区撤回去"**不是它的职责** —— 那是普通的 `git reset --hard <base>` /
 `git checkout <base> -- .`,模型有 bash,自己就能做。
 
-工具只管"图",不管"工作区" —— 这条分工让 `node_drop` 小到不能再小。
+工具只管"图",不管"工作区" —— 这条分工让 `node_abandon` 小到不能再小。
 
 ### `node_status` 是这套东西的使用体验所在
 
