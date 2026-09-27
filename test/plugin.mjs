@@ -280,6 +280,99 @@ if (childNoTok.ok === false && approvalsAsked === 0 && /需要它父节点/.test
   bad(`改子节点不该弹窗: asked=${approvalsAsked} ${JSON.stringify(childNoTok).slice(0, 160)}`);
 }
 
+// --- 1c. 达成拆成两步:子请示父,顶层降级问人 -------------------------------
+//
+// 这一段锁的是**分岔优先级**:谁能批准、该问谁。
+// 它容易出错的地方在于 `resolveActor` 里有一道冗余判断
+// (只认 requiredAuthority === "user"),会把"顶层提交普通节点"挡回去 ——
+// 外面决定问人、里面又拒绝,变成一个没人能解开的结。
+
+console.log("\n1c. 子请示父 / 顶层降级问人");
+
+{
+  const { getNode: gn } = await import(join(ROOT, "lib", "store.mjs"));
+
+  // 子 agent:带 parentSession
+  const childExec = {
+    agent: { id: "c1", session: { id: "child-sess", header: { cwd: d, parentSession: "parent-sess" } } },
+    callId: "k1",
+  };
+  // 顶层:没有 parentSession
+  const topExec = {
+    agent: { id: "t1", session: { id: "top-sess", header: { cwd: d } } },
+    callId: "k2",
+  };
+
+  const parentAgent = { id: "parent-sess" };
+  services.agents = {
+    get: (id) => (id === "parent-sess" ? parentAgent : undefined),
+    isOwnedBy: () => true,
+  };
+  let sentCount = 0;
+  services.subagents = { sendMessage: async () => { sentCount += 1; return "m1"; } };
+
+  // (1) 子提交普通节点 -> 请示父,**不落地**
+  //
+  // 注意 P 用 `test -f x.py` —— 这个仓库里真实存在的文件。
+  // (写成 f.txt 会永远不通过,那是测试自己的错,不是被测代码的。)
+  await call("node_plan", {
+    id: "k1", parent: "root", expect: "子的活", base: BASE,
+    verify: "test -f x.py", delta: ["A:k1.txt"], token: ROOT_TOKEN,
+  });
+  writeFileSync(join(d, "k1.txt"), "x\n", "utf8");
+  sentCount = 0;
+  const toChild = await tool("node_commit").execute({ id: "k1", project: d }, childExec);
+  if (toChild.ok === true && sentCount === 1 && gn(d, "k1").state === "todo") {
+    ok("子 agent 提交 -> 请示父(1 次),节点**不落地**(还是 todo)");
+  } else {
+    bad(`子提交应请示父且不落地: sent=${sentCount} state=${gn(d, "k1").state} ${JSON.stringify(toChild).slice(0, 140)}`);
+  }
+
+  // (2) 顶层提交普通节点 -> 降级问人,**落地**
+  services.approval = approvalStub;
+  approvalsAsked = 0;
+  approvalOutcome = "allowed-once";
+  // Δ 把 k1.txt 也写进去:它是**同一个共享工作区**里的累积改动。
+  // 不写的话门禁会(正确地)报 k1.txt 预期外 —— 那正是共享工作区的老问题。
+  await call("node_plan", {
+    id: "k2", parent: "root", expect: "顶层的活", base: BASE,
+    verify: "test -f x.py", delta: ["A:k1.txt", "A:k2.txt"], token: ROOT_TOKEN,
+  });
+  writeFileSync(join(d, "k2.txt"), "y\n", "utf8");
+  const toTop = await tool("node_commit").execute({ id: "k2", project: d }, topExec);
+  if (toTop.ok === true && approvalsAsked === 1 && gn(d, "k2").state === "done") {
+    ok("顶层会话提交普通节点 -> **降级问人**(1 次),落地");
+  } else {
+    bad(`顶层应降级问人并落地: asked=${approvalsAsked} state=${gn(d, "k2").state} ${JSON.stringify(toTop).slice(0, 140)}`);
+  }
+
+  // (3) 门禁没过时,谁都不打扰 —— "先验,再提权"
+  await call("node_plan", {
+    id: "k3", parent: "root", expect: "没干活", base: BASE,
+    verify: "test -f x.py", delta: ["A:k3.txt"], token: ROOT_TOKEN,
+  });
+  sentCount = 0;
+  approvalsAsked = 0;
+  const miss = await tool("node_commit").execute({ id: "k3", project: d }, childExec);
+  if (miss.ok === false && sentCount === 0 && approvalsAsked === 0) {
+    ok("门禁没过 -> **谁也不打扰**(先验,再提权)");
+  } else {
+    bad(`门禁没过不该打扰任何人: sent=${sentCount} asked=${approvalsAsked}`);
+  }
+
+  delete services.agents;
+  delete services.subagents;
+
+  // **把工作区还原** —— 这一段在**共享仓库 d** 上跑,留下的文件会污染
+  // 后面的测试(p-1 的门禁会把 k1.txt/k2.txt 报成"预期外",连锁三条失败)。
+  // 实测踩过:单独跑这一节全过,整文件跑就 3 条败。
+  sh("git checkout -- .");
+  for (const f of ["k1.txt", "k2.txt"]) {
+    try { rmSync(join(d, f), { force: true }); } catch { /* 已经没了 */ }
+  }
+  sh("git reset -q HEAD");   // k2 提交过,k1 没有 —— 索引也要跟上
+}
+
 // 拆掉审批服务,回到"没有通道"的默认状态给后面的测试用
 delete services.approval;
 

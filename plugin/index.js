@@ -310,13 +310,19 @@ async function askParent({ ctx, exec, summary }) {
  * 只在"真的需要 user、而手上又没有凭证"时才弹窗 ——
  * 拿得出凭证的调用**一次都不会打扰人**。
  */
-async function resolveActor({ ctx, exec, toolName, node, args, what, detail }) {
+async function resolveActor({ ctx, exec, toolName, node, args, what, detail, force = false }) {
   const direct = actorOf(args);
   if (direct) return { ok: true, actor: direct };
 
-  // 这次操作到底要不要人?
+  // `force` = 调用方已经决定"这次就该问人",别在这里再判一次。
+  //
+  // 为什么需要它:原来这里只认 `requiredAuthority(node) === "user"`,
+  // 于是**普通子节点**会直接返回 `actor: null`(交给 lib 去报"缺谁的凭证")。
+  // 但"顶层会话没有父 agent"这种情况是**调用方**才知道的判断
+  // (它要看 session.header),这里看不出来 —— 结果就是顶层提交普通节点
+  // 时,外面决定问人、里面又把它挡回去,变成一个没人能解开的结。
   const need = requiredAuthority(node);
-  if (need !== "user") return { ok: true, actor: null };   // 交给 lib 去报"缺谁的凭证"
+  if (!force && need !== "user") return { ok: true, actor: null };
 
   return requestUserActor({ ctx, exec, toolName, what, detail });
 }
@@ -625,12 +631,33 @@ export function apply(ctx) {
           };
         }
 
+        // ---------- 门禁过了,决定问谁要授权 ----------
+        //
+        // 三种情况,而且**优先级是刻意的**:
+        //
+        //     ① 目标需要人(根 / owner=user)  -> 问人(弹窗)
+        //     ② 我有父 agent                  -> 问父(异步请示)
+        //     ③ 我是顶层(没有父 agent)         -> 也问人(弹窗)
+        //
+        // 第 ③ 条是**降级**,不是绕过:顶层会话(比如直接跟人对话的那个
+        // agent)本来就不该卡死 —— 它上面没有人可以替它批准,而它又是
+        // 人在直接指挥的。让它走弹窗,等于"人当场授权",和 ① 是同一件事。
+        //
+        // 缺了 ③ 的话,顶层 agent 提交任何普通节点都会撞上"没有可请示的
+        // 父"而卡住 —— 一个没人能解开的死结。
         const need = requiredAuthority(node);
-        if (need === "user") {
+        const parentId = exec?.agent?.session?.header?.parentSession ?? null;
+        const askHuman = (need === "user") || !parentId;
+
+        if (askHuman) {
+          const why = need === "user"
+            ? `提交(达成)节点 ${node.id}`
+            : `提交(达成)节点 ${node.id}(顶层会话,没有父 agent 可请示)`;
           const resolved = await resolveActor({
             ctx, exec, toolName: "node_commit", node, args,
-            what: `提交(达成)节点 ${node.id}`,
+            what: why,
             detail: describe(node),
+            force: true,   // 调用方已经判定"该问人"(见上面 askHuman)
           });
           if (!resolved.ok) {
             return { ok: false, summary: `${args.id} **没有提交** —— 没拿到人的授权`, lines: brief(resolved.problems) };
