@@ -192,10 +192,19 @@ function main() {
   // **HTML:写到文件,不打到 stdout。**
   // 打到 stdout 的话 `bg html > x.html` 能用,但管道里混着别的输出就废了;
   // 而且默认给一个确定路径,人不用记重定向。
+  //
+  // ⚠ 这个页面**不再是自包含单文件**了(2026-09-30 改):图交给 mermaid 布局,
+  // 从 CDN 取。取舍和代价写在 lib/mermaid.mjs 顶部。断网时会优雅降级,
+  // 把节点清单用纯文字列出来 —— 但**必须说清**,不然人会以为仓库是空的。
   if (cmd === "html") {
     const dest = positional[1] ?? join(dir, ".bg", "tree.html");
     writeFileSync(dest, renderHtml(dir), "utf8");
-    out([`写好了 ${dest}`, "  浏览器打开即可。它是**单文件**,不联网、不依赖任何东西。"]);
+    out([
+      `写好了 ${dest}`,
+      "  浏览器打开即可。",
+      "  ⚠ 图靠 mermaid 渲染,**打开时需要联网**(从 jsdelivr CDN 取 3.3MB)。",
+      "    断网时页面会明说加载失败,并把节点清单用纯文字列出来 —— 图没了,信息不丢。",
+    ]);
     return;
   }
 

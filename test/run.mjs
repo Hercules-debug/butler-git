@@ -731,6 +731,318 @@ head("19. P 的程序文件路径(保守推断)");
   else bad(`推不出来该明说,实际:${t4.slice(0, 200)}`);
 }
 
+// ============================================================ 20. 图渲染(mermaid)
+//
+// 这一节是**补上的**。上一版渲染改完"一条验收都没加",测试 73/73 过,
+// 但跑的**全是旧测试**,新渲染零覆盖 —— 那是这个仓库记过的错之一。
+//
+// 所以这里**只测纯函数**(toMermaid:数据 -> 文本),不测浏览器。
+// 理由:mermaid 渲染在浏览器里,node 测不到;但**生成什么样的文本**
+// 完全在我们手里,而文本错了浏览器只会给你一片空白 —— 图错了却
+// 没人报错,正是最该拦的。
+
+head("20. 图渲染:分叉必须画对,不能编造顺序");
+
+/** 造一个**真的有分叉**的仓库 —— 直线历史证明不了任何事。 */
+function forkRepo() {
+  const d = newRepo();
+  sh("git checkout -q -b side", d);
+  write(d, "side.txt", "s\n");
+  sh("git add -A", d);
+  sh("git commit -qm side", d);
+  const side = headSha(d);
+  sh("git checkout -q master || git checkout -q main", d);
+  write(d, "main.txt", "m\n");
+  sh("git add -A", d);
+  sh("git commit -qm main", d);
+  const main = headSha(d);
+  sh("git merge --no-commit side >/dev/null 2>&1 || true", d);
+  sh('git commit -qm merge || true', d);
+  return { d, side, main };
+}
+
+{
+  const { d, side, main } = forkRepo();
+  const base = sh("git rev-list --max-parents=0 HEAD", d).stdout.trim();
+
+  const r = bg(d, ["plan", "--as-user", "--id", "root", "--expect", "起点",
+    "--base", base, "--verify", "true"]);
+  const tok = (r.out.match(/[a-f0-9]{32}/) ?? [])[0];
+  bg(d, ["plan", "--token", tok, "--id", "onSide", "--parent", "root",
+    "--expect", "分支上的活", "--base", side, "--verify", "true"]);
+  bg(d, ["plan", "--token", tok, "--id", "onMain", "--parent", "root",
+    "--expect", "主线上的活", "--base", main, "--verify", "true"]);
+
+  const { graphData, toMermaid } = await import(join(HERE, "..", "lib", "mermaid.mjs"));
+  const g = graphData(d);
+  const src = toMermaid(g);
+
+  // ---- 负向 0:必须是一棵**连通的**树,不能有游离的点 ----
+  //
+  // **这条是人肉眼看出来的,说明前面 6 条都没拦住它。**
+  //
+  // 上一版生成了两套点:commit 点(c*)和节点框(n*),而 `-.->` 只在
+  // n 和 n 之间 —— **没有任何边把 n 连到 c**。mermaid 看到两个互不相连的
+  // 连通分量,就把它们画成两块,人看到的是"好几棵分离的树"。
+  //
+  // 根因是模型错了:节点**依托于某个 commit**,该是同一个点,
+  // 不是两个点再加一条线。所以这里按**连通分量**验,而不是数点数。
+  {
+    const allEdges = src.split("\n")
+      .filter((l) => /-->/.test(l))
+      .map((l) => {
+        const m = l.match(/(c\d+)\s*-+>\s*(c\d+)/);
+        return m ? [m[1], m[2]] : null;
+      })
+      .filter(Boolean);
+    const pts = src.split("\n")
+      .filter((l) => l.includes(":::") && l.includes("["))
+      .map((l) => l.trim().split("[")[0].trim());
+
+    const adj = new Map();
+    for (const [a, b] of allEdges) {
+      if (!adj.has(a)) adj.set(a, []);
+      if (!adj.has(b)) adj.set(b, []);
+      adj.get(a).push(b);
+      adj.get(b).push(a);
+    }
+    let comps = 0;
+    const seen2 = new Set();
+    for (const p of pts) {
+      if (seen2.has(p)) continue;
+      comps += 1;
+      const q = [p];
+      while (q.length) {
+        const x = q.shift();
+        if (seen2.has(x)) continue;
+        seen2.add(x);
+        for (const y of adj.get(x) ?? []) q.push(y);
+      }
+    }
+
+    if (pts.length > 1 && comps === 1) {
+      ok(`图是**一棵连通树**:${pts.length} 个点,${allEdges.length} 条边,1 个连通分量`);
+    } else {
+      bad(`图裂成了 ${comps} 块(共 ${pts.length} 个点)—— `
+        + "节点必须画在它所属的 commit 上,不能另立游离的点");
+    }
+  }
+
+  // ---- 负向 0.5:上下必须 = 时间顺序(旧在上,新在下)----
+  //
+  // **这条也是人肉眼看出来的。** 实测踩的坑:
+  //
+  // 意图父子原本画成 `父 -.-> 子`,而 `root.result` 比 `t1.result` **晚**
+  // (父节点**后**达成),于是虚线要求"父在上"、实线要求"旧在上" ——
+  // **两种关系方向打架**,mermaid 服从虚线,把 root 拉到最顶,
+  // 整条实线链**翻了过来**。
+  //
+  // ⚠ **这个坑需要专门的场景才复现**:必须有一个节点,它的**父节点
+  // 比它晚达成**。全是 todo 的仓库复现不了 —— 那种情况下大家都锚在
+  // base 上,方向天然一致,翻不翻都看不出来。
+  // (实测:这条验收的第一版就是这么**空过**的,变异测试照样全绿。)
+  //
+  // 所以这里**专门造**那个场景:先达成子,后达成父。
+  {
+    const d2 = newRepo();
+    const b0 = headSha(d2);
+    const r2 = bg(d2, ["plan", "--as-user", "--id", "father", "--expect", "父",
+      "--base", b0, "--verify", "true"]);
+    const tok2 = (r2.out.match(/[a-f0-9]{32}/) ?? [])[0];
+    bg(d2, ["plan", "--token", tok2, "--id", "child", "--parent", "father",
+      "--expect", "子", "--base", b0, "--verify", "true"]);
+
+    // 子先达成
+    write(d2, "c.txt", "c\n");
+    bg(d2, ["commit", "child", "--token", tok2]);
+
+    // 父后达成(于是 父.result 比 子.result 新)
+    //
+    // ⚠ 注意:father 是**根节点**,commit 它需要 `--as-user` ——
+    // agent 拿不到根的凭证(实测:`节点 father 是根节点 —— 改它需要人的凭证`)。
+    // 这里不写 `--as-user` 的话它会**静默不达成**,场景就造不出来。
+    write(d2, "f2.txt", "f\n");
+    bg(d2, ["commit", "father", "--as-user"]);
+
+    // result 要从节点库里读 —— `bg status` 只打短 sha,拿不到完整值。
+    const { allNodes: allNodes2 } = await import(join(HERE, "..", "lib", "store.mjs"));
+    const nd = Object.fromEntries(allNodes2(d2).map((n) => [n.id, n]));
+    const childSha = nd.child?.result ?? null;
+    const fatherSha = nd.father?.result ?? null;
+
+    const m2 = toMermaid(graphData(d2));
+    const map2 = {};
+    for (const l of m2.split("\n")) {
+      const m = l.trim().match(/^(c\d+)\["([a-f0-9]{8})/);
+      if (m) map2[m[1]] = m[2];
+    }
+    // ⚠ **键必须是短 sha** —— `map2` 里存的是 label 里的 8 位短 sha,
+    // 而 `git log --format=%H` 给的是 40 位。直接拿完整 sha 做键,
+    // `rank.get()` 会**静默返回 undefined**,比较永远 false,
+    // 这条验收就变成了永远通过的死代码。(实测踩过:变异测试全绿。)
+    const order2 = sh("git log --reverse --format=%H", d2).stdout.trim().split("\n");
+    const rank2 = new Map(order2.map((sha, i) => [sha.slice(0, 8), i]));
+
+    // ⚠ 过滤条件**不能**写 `/-->/` —— `-.->` 不含 `-->`,
+    // 虚线会被整条丢掉,这条验收就只验了实线(实测:变异测试全绿)。
+    // 正确做法:先按"含箭头"捞,再从中区分两种线。
+    const all2 = m2.split("\n")
+      .map((l) => l.match(/(c\d+)\s*(-\.->|-->)\s*(c\d+)/))
+      .filter(Boolean)
+      .map((mm) => [mm[1], mm[3], mm[2].includes(".") ? "虚线" : "实线"]);
+
+    const wrong2 = all2.filter(([a, b]) => {
+      const ra = rank2.get(map2[a]);
+      const rb = rank2.get(map2[b]);
+      return ra != null && rb != null && ra > rb;
+    });
+
+    if (!childSha || !fatherSha || childSha === fatherSha) {
+      // 场景没造出来 -> 这条等于没验,必须报错而不是静默通过。
+      bad("父后达成的场景没造出来(父子没产出两个不同 commit)—— 这条等于没验");
+    } else if (all2.length && !wrong2.length) {
+      ok(`父比子晚达成时,${all2.length} 条边仍然"旧在上" —— 没被虚线带翻`);
+    } else {
+      bad(`父比子晚达成时图会翻:${wrong2.length}/${all2.length} 条边要求"新的在上"(`);
+    }
+  }
+
+  // ---- 负向 1:分叉必须出现两条实线 ----
+  //
+  // **这条是这一节存在的理由。** 上一版把提交映射成一个标量
+  // (`git rev-list --count`),在分叉历史里**编造了一个顺序** ——
+  // 它在本仓库(纯线性)上看起来是对的,那是最坏的那种错。
+  const solid = src.split("\n").filter((l) => l.includes("-->"));
+  if (solid.length >= 2) {
+    ok(`分叉画出来了:${solid.length} 条 git 实线`);
+  } else {
+    bad(`分叉没画出来 —— 只找到 ${solid.length} 条实线。真正的分叉要有两条`);
+  }
+
+  // ---- 负向 2:不能把提交压成一个标量/序号 ----
+  //
+  // 只要源码里出现"第几个提交"这种数字排序,就是又在编造顺序。
+  const ids = src.match(/\bc\d+\b/g) ?? [];
+  if (ids.length && !/--count|rev-list\s+--count/.test(src)) {
+    ok("按 git 父子画,没有用提交计数编造顺序");
+  } else {
+    bad("疑似又用提交计数当坐标 —— 分叉历史里那是在编造顺序");
+  }
+
+  // ---- 负向 3:意图父子必须是虚线,不能和 git 实线混 ----
+  const dashed = src.split("\n").filter((l) => l.includes("-.->"));
+  if (dashed.length >= 2) {
+    ok(`意图父子用虚线:${dashed.length} 条`);
+  } else {
+    bad(`意图父子该用虚线,实际 ${dashed.length} 条 —— 混画会让人以为两者是一回事`);
+  }
+
+  // ---- 负向 3.5:三种状态必须画成三种,不能把"进行中"吞成"已达成" ----
+  //
+  // 实测踩的坑:一个点上落了多个节点时,我原来只判
+  // `owners.some(state === "done")` —— **"进行中"整个被吞了**。
+  // 建两个改了工作区的节点,它们和已达成节点共用同一个 commit,
+  // 于是被标成**绿色**,看起来像"已经完成" —— 而真相是正在改。
+  //
+  // 这条验收的关键在**一个 commit 上同时挂 done 和 wip**,
+  // 单节点场景测不出来。
+  {
+    const d3 = newRepo();
+    const b3 = headSha(d3);
+
+    // 先有一个**已达成**的根 —— 它会占住那个 commit。
+    bg(d3, ["plan", "--as-user", "--id", "root", "--expect", "根",
+      "--base", b3, "--verify", "true"]);
+    write(d3, "r.txt", "r\n");
+    bg(d3, ["commit", "root", "--as-user"]);
+    const { allNodes: allNodes3 } = await import(join(HERE, "..", "lib", "store.mjs"));
+    const rootSha = allNodes3(d3).find((n) => n.id === "root")?.result;
+
+    // 再声明一个**待办**节点,base 指向**同一个 commit**。
+    bg(d3, ["plan", "--as-user", "--id", "wip1", "--expect", "正在改的",
+      "--base", rootSha, "--verify", "true"]);
+
+    // 动一下工作区 —— 这才让它变成"进行中"。
+    write(d3, "w.txt", "w\n");
+
+    // ⚠ **必须传 treeY** —— 不传的话没有任何工作区信号,
+    // "进行中"就永远不可能出现,这条验收会变成**假绿**。
+    // (实测:第一版就是这么写的,测试报了红,但红的是测试自己。)
+    const { workingTreeHash: wth3 } = await import(join(HERE, "..", "lib", "git.mjs"));
+    const m3 = toMermaid(graphData(d3), { treeY: wth3(d3) });
+    const line = m3.split("\n").find((l) => l.includes("[")) ?? "";
+    // 那个点同时挂着 root(done)和 wip1(进行中)-> 必须画成 wip(橙)
+    if (/:::wip/.test(line)) {
+      ok("同一点上 done + 进行中 -> 画成**进行中**(没被绿色吞掉)");
+    } else {
+      bad(`同一点上有"进行中"的节点,却被画成 ${(line.match(/:::\w+/) ?? [])[0]} `
+        + "—— 会让人以为已经完成了");
+    }
+
+    // 而且三种 classDef 都得有,否则 mermaid 认不出 wip 这个类。
+    if (/classDef\s+wip/.test(m3)) ok("声明了 wip 的 classDef(橙)");
+    else bad("没有 wip 的 classDef —— 进行中的点会没有颜色");
+  }
+
+  // ---- 负向 4:双引号必须被换掉 ----
+  //
+  // 实测:expect 里有一个半角 `"` 就会让**整张图渲染失败**(不是画错,
+  // 是空白)。仓库自己的历史里就有一条 `删掉"绕过"概念`。
+  const dq = newRepo();
+  const bq = headSha(dq);
+  bg(dq, ["plan", "--as-user", "--id", 'say"hi', "--expect", '含"引号"的意图',
+    "--base", bq, "--verify", "true"]);
+  const qsrc = toMermaid(graphData(dq));
+  const stray = qsrc.split("\n")
+    .filter((l) => l.includes("[\""))
+    .some((l) => {
+      // 把首尾那对引号剥掉,里面不该再有半角双引号
+      const inner = l.slice(l.indexOf('["') + 2, l.lastIndexOf('"]'));
+      return inner.includes('"');
+    });
+  if (!stray) ok("label 里的半角双引号被换掉(否则整张图会空白)");
+  else bad("label 里还有半角双引号 —— mermaid 会解析失败,页面一片空白");
+
+  // ---- 负向 4.5:两条渲染路径都要传 treeY,否则实时版看不出"进行中" ----
+  //
+  // 实测踩的坑:`bg html`(静态)传了 `treeY`,但 `bg serve`(实时)
+  // **漏了** —— 于是同一个仓库,静态页能看出"进行中",实时页却
+  // 永远是绿/灰两色。**两条路径渲染同一个东西,却给出不同的答案。**
+  //
+  // 这条不启服务(那要开端口),而是**直接查源码**:两个入口都必须
+  // 把 treeY 交给渲染。源码级守卫比跑一遍更稳,也更便宜。
+  {
+    const htmlSrc = readFileSync(join(HERE, "..", "lib", "html.mjs"), "utf8");
+    const serveSrc = readFileSync(join(HERE, "..", "lib", "serve.mjs"), "utf8");
+    const hasTreeY = (s) => /mermaidHtml\([\s\S]{0,200}?treeY:/.test(s);
+
+    if (hasTreeY(htmlSrc)) ok("bg html 传了 treeY(能判出\"进行中\")");
+    else bad("bg html **没传 treeY** —— 进行中的节点会显示成待办");
+
+    if (hasTreeY(serveSrc)) ok("bg serve 传了 treeY(能判出\"进行中\")");
+    else bad("bg serve **没传 treeY** —— 实时页看不出进行中,和静态页不一致");
+  }
+
+  // ---- 负向 5:断网兜底必须存在 ----
+  //
+  // 引了 CDN 就意味着**断网打不开图**。打不开不能表现成空白 ——
+  // 那会让人以为"这个仓库没有节点"。纯 HTML 的文字清单必须在。
+  const page = bg(d, ["html"]).out;
+  const file = read(d, ".bg/tree.html");
+  if (/断网时的节点清单/.test(file) && /<li>/.test(file)) {
+    ok("断网兜底:页面里有纯文字节点清单(不依赖 JS)");
+  } else {
+    bad("没有断网兜底 —— 图打不开时页面会是空白,人会以为没有节点");
+  }
+
+  // ---- 负向 6:必须说清"要联网" ----
+  if (/需要联网|加载不了 mermaid/.test(file)) {
+    ok("说清了图需要联网,不假装自包含");
+  } else {
+    bad("没说清要联网 —— 断网时人会以为是工具坏了");
+  }
+}
+
 // ============================================================ 结果
 
 cleanup();

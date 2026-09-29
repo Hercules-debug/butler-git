@@ -1,6 +1,10 @@
 # butler-git —— 节点是「意图」,commit 是「证据」
 
-**零依赖。** 只需要 `node` 和 `git`。
+**门禁零依赖。** `plan` / `status` / `commit` / `abandon` / `approve` 只需要 `node` 和 `git`。
+
+> **一个例外,写在这免得误解**:`bg html`(给人看图的那条命令)用 mermaid 做布局,
+> 从 CDN 取 —— 打开页面需要联网。**渲染坏了不影响门禁**,那条规矩在门禁上没破。
+> 为什么破、代价多大,见「那张图在画什么」一节和 `lib/mermaid.mjs` 顶部。
 
 ```
 节点先存在(你要达成什么),commit 后出现(你做完了什么)。
@@ -38,11 +42,20 @@ $BG abandon  n7          # 放弃一个声明了但没做的任务
 
 # 人的面
 $BG tree                 # 看整棵树(灯 + P 原文 + 弱 P 标记 + 图外的提交)
+$BG html                 # 生成 .bg/tree.html —— 一幅真 DAG 图(点=commit,线=git 父子)
+$BG serve                # 前台实时查看器(默认 127.0.0.1:8731)
 $BG recheck              # 对当前 commit 复查各历史节点(诊断,不是灯)
 $BG health               # 心跳一行
 $BG log                  # 从 commit trailer 读出来的历史
 $BG crosscheck           # 图和 commit 对不对得上
 ```
+
+> **`bg html` 的图需要联网。** 它用 mermaid 做布局(从 jsdelivr CDN 取,3.3MB)。
+> 断网时页面会**明说加载失败**,并把节点清单用纯文字列出来 —— 图没了,信息不丢。
+> 取舍的原因和实测代价见 `lib/mermaid.mjs` 顶部。
+>
+> **门禁本身不受影响**:`plan` / `status` / `commit` / `abandon` / `approve`
+> 仍然只需要 `node` 和 `git`,渲染坏了也不影响它们。
 
 ---
 
@@ -371,11 +384,30 @@ node_plan 声明一个意图  ->  它必须被记下来(否则人看不见计划
 
 ```
 bg tree       看整棵树(灯 + 状态 + 弱 P 标记 + 图外的提交)
+bg html       生成 .bg/tree.html —— 一幅真 DAG 图(**需要联网**)
+bg serve      前台实时查看器(默认 127.0.0.1:8731)
 bg recheck    对当前 commit 复查各历史节点 —— 诊断,不是灯
 bg health     心跳一行
 bg log        从 commit trailer 读出来的历史
 bg crosscheck 图和 commit 对不对得上
 ```
+
+### 那张图在画什么
+
+`bg html` 画的是**真 git DAG**,不是"按某个数值排成一行":
+
+```
+● = commit(只画有节点的点,普通提交压成线)
+实线 -->    = git 父子(`git log %P`)—— 这就是主干,分叉/合并原样保留
+虚线 -.->   = 意图父子(节点的 parent 字段)—— "谁拆给谁的"
+```
+
+**两种线必须分开。** 混画会让人以为"拆给谁的"就是"代码从哪儿来的",那是撒谎。
+
+上一版把提交映射成一个标量(`git rev-list --count`)当坐标 —— 那在**分叉历史里
+会编造一个顺序**。本仓库恰好是纯线性的,所以它**看起来是对的**,那是最坏的那种错。
+现在只画 git 真实给出的父子关系,不映射成"第几个"。`test/run.mjs` 第 20 节
+会另造一个**真有分叉**的仓库来验这件事 —— 直线历史证明不了任何事。
 
 ### 复查不是灯,是一次查询
 
@@ -558,9 +590,12 @@ butler-git/
 │   ├── gate.mjs      门禁求值:Δ + P -> ok / fail / unknown
 │   ├── nodes.mjs     写路径:plan / commit / abandon + 冻结 + 权限 + trailer
 │   ├── recheck.mjs   复查(诊断)+ 篡改检测 + 图和 commit 交叉校验
-│   └── view.mjs      渲染(只画,不算)
+│   ├── view.mjs      渲染(只画,不算)—— 终端版
+│   ├── html.mjs      HTML 外壳 + 取数据(buildTree)
+│   ├── mermaid.mjs   图 -> mermaid flowchart(网页版;**唯一破了"零依赖"的地方**)
+│   └── serve.mjs     前台实时查看器
 ├── plugin/           DSH 工具插件(四个工具)
-└── test/             run.mjs(57 条负向验收)+ plugin.mjs(26 条)
+└── test/             run.mjs(79 条负向验收)+ plugin.mjs(39 条)
 ```
 
 **逻辑只有一份**:插件和 CLI 都调 `lib/`。这不是洁癖 ——
