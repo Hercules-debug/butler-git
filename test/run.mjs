@@ -325,9 +325,22 @@ head("8. 证据:verified-tree 与篡改");
   }
 }
 
-// ============================================================ 9. 绕过
+// ============================================================ 9. 没有"绕过"这回事
+//
+// **这一节取代了原来的「绕过:裸 git commit 会被看见」。**
+//
+// 那套把"没走节点的提交"标成「⚠ 绕过了门禁」,是错的:
+//
+//     节点(node) = 一种**记录**
+//     git commit = 一个**工具**
+//
+// 模型用 git commit 是正常干活,不是绕过谁。"⚠ 绕过了门禁"在暗示
+// 存在一条没被遵守的规矩 —— 那是在编造规则,会让人以为出了问题。
+//
+// 所以现在的立场是:**图只显示有记录的节点,别的不管。**
+// 这一节锁的就是这个 —— 有人把"不报"当成"忘了报"的话,这里会说话。
 
-head("9. 绕过:裸 git commit 会被看见");
+head("9. 没有\"绕过\"这回事:git 那边发生什么,图不管");
 {
   const d = newRepo();
   const { token, base: b } = seedRoot(d);
@@ -336,18 +349,27 @@ head("9. 绕过:裸 git commit 会被看见");
   write(d, "f.txt", "v1\n");
   bg(d, ["commit", "n1", "--token", token]);
 
-  // 绕过
-  write(d, "sneaky.txt", "x\n");
+  // 一次**普通的** git 提交 —— 没走节点,但那不是违规
+  write(d, "plain.txt", "x\n");
   sh("git add -A", d);
-  sh("git commit -qm '绕过门禁'", d);
+  sh("git commit -qm '一次普通的提交'", d);
 
   const r = bg(d, ["tree"]);
-  if (/不在图里/.test(r.out) && /绕过了门禁/.test(r.out)) ok("裸 commit -> tree 报出来");
-  else bad(`绕过应该被发现,实际:${r.out}`);
+  if (!/绕过|不在图里/.test(r.out)) ok("普通 git commit -> tree **不**说它绕过(那不是违规)");
+  else bad(`不该报绕过,实际:${r.out}`);
+
+  // 它仍然该**算进历史** —— 图不该因此错乱
+  if (/n1/.test(r.out) && /root/.test(r.out)) ok("图本身照常(有记录的节点还在)");
+  else bad(`图不该受影响,实际:${r.out}`);
 
   const h = bg(d, ["health"]);
-  if (/绕过门禁/.test(h.out)) ok("heartbeat 也报绕过数");
-  else bad(`health 应该报绕过,实际:${h.out}`);
+  if (!/绕过/.test(h.out)) ok("health 也不报绕过数");
+  else bad(`health 不该报绕过,实际:${h.out}`);
+
+  // 但 walk 到 git 层面,那个提交**确实在** —— 我们没假装它不存在
+  const log = sh("git log --oneline", d).stdout;
+  if (/一次普通的提交/.test(log)) ok("它当然还在 git 历史里(我们没假装它不存在)");
+  else bad(`git 历史该有它,实际:${log}`);
 }
 
 // ============================================================ 10. 合并
