@@ -33,7 +33,7 @@ B=$(git rev-parse HEAD)
 $BG plan     --id n7 --expect "让导出支持非 ASCII" --base $B \
              --verify "pytest -q" --delta "M:src/csv.py" --delta "A:src/enc.py"
 $BG status   n7          # 改了什么;和 Δ 比差在哪(便宜,不跑 P)
-$BG commit   n7          # 提交即门禁:Δ + P + 根 P,过了才产生版本
+$BG commit   n7          # 提交即门禁:Δ + P,过了才产生版本
 $BG abandon  n7          # 放弃一个声明了但没做的任务
 
 # 人的面
@@ -318,7 +318,7 @@ $ bg tree
 |---|---|---|
 | `node_plan` | 声明一个任务(base / expect / Δ? / P) | 否 |
 | `node_status` | 相对 base 改了什么;**和 Δ 比差在哪** | **否**(和 `git status` 一样便宜) |
-| `node_commit` | **提交即门禁**:Δ + P + 根 P,过了才产生版本 | 是 |
+| `node_commit` | **提交即门禁**:Δ + P,过了才产生版本 | 是 |
 | `node_abandon` | 把一个**声明了但没做**的任务从图里移除 | 否 |
 
 上一版 25 个(后来收到 6 个)是负担 ——
@@ -555,7 +555,7 @@ butler-git/
 │   ├── store.mjs     图 + 追加式账本 + 排它锁
 │   ├── delta.mjs     Δ:解析 / 自洽检查 / 三方比对(漏做·预期外·方向错)
 │   ├── cap.mjs       凭证:签发 / hash / 向下包含判定
-│   ├── gate.mjs      门禁求值:Δ + P + 根 P -> ok / fail / unknown
+│   ├── gate.mjs      门禁求值:Δ + P -> ok / fail / unknown
 │   ├── nodes.mjs     写路径:plan / commit / abandon + 冻结 + 权限 + trailer
 │   ├── recheck.mjs   复查(诊断)+ 篡改检测 + 图和 commit 交叉校验
 │   └── view.mjs      渲染(只画,不算)

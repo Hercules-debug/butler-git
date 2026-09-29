@@ -317,7 +317,7 @@ B:加了个 report(),依赖 total() 返回数字
                  ┌────────┐
                  │  todo  │  声明了,没有 commit
                  └───┬────┘
-        node_commit  |  (Δ 匹配 且 P 通过 且 根 P 通过)
+        node_commit  |  (Δ 匹配 且 P 通过)
                      v
                  ┌────────┐
                  │  done  │  有一个结果 commit;绿;门禁冻结

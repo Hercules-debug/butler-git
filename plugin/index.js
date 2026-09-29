@@ -68,9 +68,20 @@ const PROJECT_PARAM = {
   project: {
     type: "string",
     description:
-      "工作目录(默认 = 会话 cwd)。图在它的 .bg/ 下。"
+      "工作目录(默认 = 会话 cwd)。**图在它的 .bg/ 下。**\n"
       + "**当你要操作的项目不是你当前所在的目录时,必须显式给这个参数** —— "
-      + "否则工具会去找会话 cwd 的 .bg/,看不见你在别处声明的节点。",
+      + "否则工具会去找会话 cwd 的 .bg/,看不见你在别处声明的节点。\n"
+      + "\n"
+      + "**`git worktree` 的场合尤其注意(会静默出事)。**\n"
+      + "想并行干活时,给每个子 agent 开一个 worktree 是合适的做法 —— "
+      + "那是 git 的能力,用 `git worktree add` 就行,这个工具不掺和。\n"
+      + "但在 worktree 里调本工具时,**`project` 必须指向主工作区**\n"
+      + "(图在主工作区的 `.bg/` 里,不在 worktree 里)。\n"
+      + "忘了给的话,工具会**安静地**在 worktree 里新建一份图 —— "
+      + "你的节点就不在主图里了,而且没有任何报错。\n"
+      + "\n"
+      + "反过来,父 agent **不需要**进子的 worktree:子报上来的是一个 "
+      + "commit sha,而 commit 对象在所有 worktree 之间是共享的。",
   },
 };
 
@@ -134,7 +145,7 @@ function actorOf(args) {
  *
  * `allowed-once` 只对**这一次工具调用**有效 —— 不写库、不签发凭证、
  * 不改变以后任何一次调用。而且它只解决"你有没有权":
- * 之后的 Δ 比对、P、根 P 照样要跑,过了才是绿。
+ * 之后的 Δ 比对和 P 照样要跑,过了才是绿。
  * **权限和门禁是两道独立的门。**
  *
  * ## fail-closed
@@ -172,7 +183,7 @@ async function requestUserActor({ ctx, exec, toolName, what, detail }) {
     `butler-git:${what}`,
     detail,
     "这是**根节点/人定的节点** —— 它的凭证只能由人签发,agent 拿不到。",
-    "允许 = 仅这一次放行(仍要过 Δ + P + 根 P);不会签发任何凭证。",
+    "允许 = 仅这一次放行(仍要过 Δ + P);不会签发任何凭证。",
   ].filter(Boolean).join("\n");
 
   let outcome;
@@ -415,7 +426,18 @@ export function apply(ctx) {
           required: true,
           description:
             "**检测程序 P**:一条命令,退出码 0 才算过。必须有 —— "
-            + "Δ 只管\"改的是不是这些文件\",没有 P 就没有任何东西说\"改对了\"。",
+            + "Δ 只管\"改的是不是这些文件\",没有 P 就没有任何东西说\"改对了\"。\n"
+            + "\n"
+            + "**P 的质量决定这个节点的绿有没有意义。** 机器只能判\"有没有 P\"、\n"
+            + "\"是不是恒真\"(弱 P 会被标出来),判不了 P 够不够。所以这条靠你:\n"
+            + "\n"
+            + "  ✗ `true` / `test -f x.py`   —— 几乎恒真,验不了你做没做\n"
+            + "  ✓ `grep -q v2 x.py`          —— 验**你这次那个改动**,不只是文件在\n"
+            + "  ✓ `node test/plugin.mjs`     —— 跑一套真的验收(本仓库自己的用法)\n"
+            + "  ✓ `npm test && node test/x`  —— 改动动到核心时,跑全量\n"
+            + "\n"
+            + "拿不准就问自己:**如果我把这次改动整个撤销,P 还会通过吗?**\n"
+            + "会通过的话,它就不是 P。",
         },
         verify_path: {
           type: "string",
@@ -428,7 +450,7 @@ export function apply(ctx) {
         },
         parent: {
           type: "string",
-          description: "父节点 id。不给 = 这是**根**节点(它的 P 会变成所有人的根门禁)",
+          description: "父节点 id。不给 = 这是**根**节点(一个任务的起点;它的 P 只在自己提交时跑,不压别人)",
         },
         owner: {
           type: "string",
@@ -558,7 +580,7 @@ export function apply(ctx) {
     defineTool({
       name: "node_commit",
       description:
-        "**提交即门禁**:Δ + P + 根 P,全过才产生一个版本(commit)。**不过就不提交。**\n"
+        "**提交即门禁**:Δ + P,全过才产生一个版本(commit)。**不过就不提交。**\n"
         + "\n"
         + "顺序:先固定工作区的树 Y -> 在 Y 上跑 P -> 过了才用 commit-tree 精确提交 Y。\n"
         + "所以 commit 的内容**就是**被验过的那个内容,一个字节都不差 —— "
